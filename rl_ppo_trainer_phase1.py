@@ -71,10 +71,6 @@ class DirectMLSafeAdamW(Optimizer):
 # 2. ネットワーク構成要素 (Network Components)
 # ==========================================
 
-# ==========================================
-# 2. ネットワーク構成要素 (Network Components)
-# ==========================================
-
 class FiLMResBlock2D(nn.Module):
     def __init__(self, channels, cond_dim, dropout_p=0.15):
         super(FiLMResBlock2D, self).__init__()
@@ -323,95 +319,7 @@ class MultiAgentMahjongEnvWrapper:
                 if act < 34:
                     mask[act] = 1.0
         return mask
-    """
-    リアルな日本麻雀ルールに基づく、マルチエージェント対応の半荘戦シミュレータ。
-    （基于真实日本麻将规则的多智能体半庄战环境包装器）
-    C++エンジン(pymahjong)を使用して、状態遷移と合法性判定を高速・正確に処理します。
-    """
-    def __init__(self):
-        self.env = pymahjong.MahjongEnv()
-        self.reset_hanchan()
-
-    def reset(self):
-        return self.reset_hanchan()
-
-    def reset_hanchan(self):
-        self.scores = np.array([25000, 25000, 25000, 25000], dtype=np.float32)
-        self.round_wind = 0  
-        self.round_num = 1   
-        self.dealer = 0      
-        return self.reset_hand()
-
-    def reset_hand(self):
-        self.env.reset()
-        self.current_player = self.env.get_curr_player_id()
-        return self._get_state_dict(), self._get_mask(), self.current_player
-
-    def step(self, action_id):
-        p = self.current_player
-        valid_actions = self.env.get_valid_actions()
-        reward = 0.0
-        
-        if action_id not in valid_actions:
-            if p == 0:
-                reward -= 1.0
-            return self._get_state_dict(), self._get_mask(), reward, True, p
-
-        self.env.step(p, action_id)
-        done = self.env.is_over()
-        
-        if done:
-            payoffs = self.env.get_payoffs()
-            reward = float(payoffs[0]) / 1000.0
-            self.current_player = p
-        else:
-            self.current_player = self.env.get_curr_player_id()
-            
-        return self._get_state_dict(), self._get_mask(), reward, done, self.current_player
-
-    def _get_state_dict(self):
-        p = self.current_player
-        if self.env.is_over():
-            return {
-                'state_2d': np.zeros((128, 4, 9), dtype=np.float32),
-                'cond_vec': np.zeros(16, dtype=np.float32),
-                'seq_hist': np.full(72, 272, dtype=np.int64)
-            }
-
-        obs = self.env.get_obs(p)
-        state_2d = np.zeros((128, 4, 9), dtype=np.float32)
-        hand_counts = np.sum(obs[0:4, :], axis=0) 
-
-        for i in range(34):
-            count = int(hand_counts[i])
-            if count > 0:
-                suit = i // 9
-                num = i % 9 if suit < 3 else i - 27
-                count = min(count, 4)
-                state_2d[0, suit, num] = float(count)
-
-        cond_vec = np.zeros(16, dtype=np.float32)
-        wind_idx = 4 + self.round_wind
-        if wind_idx < 8:
-            cond_vec[wind_idx] = 1.0
-        cond_vec[12] = (self.scores[p] - 25000.0) / 100000.0
-        cond_vec[13] = float(self.round_num) / 4.0
-
-        return {
-            'state_2d': state_2d,
-            'cond_vec': cond_vec,
-            'seq_hist': np.full(72, 272, dtype=np.int64) 
-        }
-
-    def _get_mask(self):
-        mask = np.zeros(34, dtype=np.float32)
-        if not self.env.is_over():
-            valid_actions = self.env.get_valid_actions()
-            for act in valid_actions:
-                if act < 34:
-                    mask[act] = 1.0
-        return mask
-
+   
 # ==========================================
 # 4. 対戦相手プール管理 (Opponent Pool Manager)
 # ==========================================
