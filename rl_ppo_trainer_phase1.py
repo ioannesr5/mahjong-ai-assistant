@@ -123,7 +123,6 @@ class DirectMLSafeTransformerLayer(nn.Module):
         return self.norm2(src + self.dropout(ff_out))
 
 class DiscardSequenceEncoder(nn.Module):
-    # 【修正】: vocab_size のデフォルト値を 273 に更新、embed_dim を 256 に同期
     def __init__(self, vocab_size=273, embed_dim=256, num_heads=8, num_layers=4):
         super(DiscardSequenceEncoder, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=272)
@@ -141,21 +140,18 @@ class DiscardSequenceEncoder(nn.Module):
         return out[:, -1, :] 
 
 class SmartMahjongMultiTaskNet(nn.Module):
-    # 【修正】: seq_vocab のデフォルト値を 273 に更新
     def __init__(self, input_channels=128, cond_dim=16, seq_vocab=273, num_blocks=10, dropout_p=0.30):
         super(SmartMahjongMultiTaskNet, self).__init__()
         self.conv_init = nn.Conv2d(input_channels, 256, kernel_size=3, padding=1, bias=False)
         self.bn_init = nn.BatchNorm2d(256)
         self.res_blocks = nn.ModuleList([FiLMResBlock2D(256, cond_dim, dropout_p) for _ in range(num_blocks)])
         
-        # SL スクリプトと同期: cnn_proj 層を追加
         self.cnn_proj = nn.Sequential(
             nn.Linear(256 * 4 * 9, 1024),
             nn.LayerNorm(1024),
             nn.ReLU(inplace=True)
         )
         
-        # SL スクリプトと同期: embed_dim=256, num_heads=8, num_layers=4
         self.seq_encoder = DiscardSequenceEncoder(vocab_size=seq_vocab, embed_dim=256, num_heads=8, num_layers=4)
         
         fused_dim = 1024 + 256
@@ -173,7 +169,6 @@ class SmartMahjongMultiTaskNet(nn.Module):
         self.aux_tenpai = nn.Linear(1024, 3)     
         self.aux_danger = nn.Linear(1024, 102)   
 
-    # SL スクリプトと同期: rl_mode パラメータを追加
     def forward(self, state_2d, cond_vec, seq_hist, rl_mode=False):
         out = F.relu(self.bn_init(self.conv_init(state_2d)))
         for block in self.res_blocks:
@@ -190,7 +185,6 @@ class SmartMahjongMultiTaskNet(nn.Module):
         p_riichi = self.policy_riichi(hidden).to(torch.float32)
         v_head = self.value_head(hidden).to(torch.float32)
         
-        # 強化学習（RL）モードの高速推論制御
         if rl_mode:
             aux_t = torch.empty(0, device=hidden.device)
             aux_d = torch.empty(0, device=hidden.device)
@@ -208,6 +202,7 @@ class MultiAgentMahjongEnvWrapper:
     """
     リアルな日本麻雀ルールに基づく、マルチエージェント対応の半荘戦シミュレータ。
     （基于真实日本麻将规则的多智能体半庄战环境包装器）
+    【注意】: 冗長なゴーストコード（幽灵代码）は完全に削除済みです。
     """
     def __init__(self):
         self.env = pymahjong.MahjongEnv()
@@ -226,7 +221,6 @@ class MultiAgentMahjongEnvWrapper:
     def reset_hand(self):
         self.env.reset()
         self.current_player = self.env.get_curr_player_id()
-        # --- 追加: 局ごとの打牌履歴を初期化 (初始化当前局的打牌历史) ---
         self.action_history = [] 
         return self._get_state_dict(), self._get_mask(), self.current_player
 
@@ -240,8 +234,7 @@ class MultiAgentMahjongEnvWrapper:
                 reward -= 1.0
             return self._get_state_dict(), self._get_mask(), reward, True, p
 
-        # --- 追加: 合法な打牌アクションを履歴に記録 (记录合法的打牌动作) ---
-        # 假设 action_id 0~33 代表常规打牌动作
+        # 履歴記録 (记录动作到牌谱序列)
         if action_id < 34: 
             self.action_history.append((p, action_id))
 
@@ -260,22 +253,12 @@ class MultiAgentMahjongEnvWrapper:
     def _get_state_dict(self):
         p = self.current_player
         
-        # ==========================================
-        # 複合エンコーディングによる牌譜履歴の構築 (Composite Encoding for Seq Hist)
-        # ==========================================
-        seq_hist = np.full(72, 272, dtype=np.int64) # 272 をパディングとして初期化
+        seq_hist = np.full(72, 272, dtype=np.int64) 
         if hasattr(self, 'action_history'):
-            recent_history = self.action_history[-72:] # 直近最大72手の打牌を取得
+            recent_history = self.action_history[-72:] 
             for idx, (actor_id, tile_id) in enumerate(recent_history):
-                # 1. 相対プレイヤー視点の計算 (0=自家, 1=下家, 2=対面, 3=上家)
                 rel_p = (actor_id - p) % 4
-                
-                # 2. ツモ切り判定のフォールバック
-                # 現在の pymahjong ラッパーではツモ切りフラグが直取得できないため、
-                # トークン崩壊を防ぐ目的で安全なデフォルト値 1 (手切) を採用
                 cut_type = 1 
-                
-                # 3. 複合トークン公式適用
                 token = int(tile_id) * 8 + rel_p * 2 + cut_type
                 seq_hist[idx] = min(token, 272)
                 
@@ -319,7 +302,7 @@ class MultiAgentMahjongEnvWrapper:
                 if act < 34:
                     mask[act] = 1.0
         return mask
-   
+
 # ==========================================
 # 4. 対戦相手プール管理 (Opponent Pool Manager)
 # ==========================================
@@ -363,7 +346,6 @@ class OpponentPoolManager:
 def async_environment_worker(worker_id, model_queue, trajectory_queue, steps_to_collect, base_policy_path):
     """
     4人のエージェント推論を統合したワーカー。厳密なブロック同期でオンポリシーを維持。
-    （集成 4 名智能体推理的 Worker，修复异步奖励丢失问题）
     """
     env = MultiAgentMahjongEnvWrapper()
     
@@ -383,7 +365,6 @@ def async_environment_worker(worker_id, model_queue, trajectory_queue, steps_to_
 
     state_dict, mask, current_player = env.reset()
     
-    # 追加: ターンをまたぐ状態と報酬の追跡変数 (用于跨越对手回合的状态与奖励追踪)
     pending_transition = None
     accumulated_reward = 0.0
     
@@ -394,9 +375,7 @@ def async_environment_worker(worker_id, model_queue, trajectory_queue, steps_to_
             
         cmd, opp_paths = msg
         if cmd == "SYNC":
-            # 【添加错峰延迟】：让 20 个 Worker 随机在 0~1 秒内错开读取，彻底抹平并发尖刺
             time.sleep(random.uniform(0.0, 1.0))
-            # 引入重试机制，防止多个 Worker 瞬间并发读取触发 Windows 极小概率的文件锁冲突
             for _ in range(10): 
                 try:
                     latest_state_dict = torch.load("sync_current_model.pth", map_location='cpu', weights_only=False)
@@ -435,7 +414,6 @@ def async_environment_worker(worker_id, model_queue, trajectory_queue, steps_to_
             action = dist.sample()
             action_val = action.item()
             
-            # --- 学習エージェント(Player 0)のターン処理 ---
             if current_player == 0:
                 log_prob_val = dist.log_prob(action).item()
                 value_val = v_score.item()
@@ -447,12 +425,9 @@ def async_environment_worker(worker_id, model_queue, trajectory_queue, steps_to_
                     steps_collected += 1
                     accumulated_reward = 0.0
                     
-                    # 【CRITICAL FIX】: 精确控制 256 步边界。如果已满，立刻中止当前不完整的采样，
-                    # 丢弃此次未执行的 action，交由下一轮拿到最新权重的模型重新思考。
                     if steps_collected >= steps_to_collect:
                         break
                     
-                # 新しい遷移状態を記録
                 pending_transition = {
                     'state_2d': state_dict['state_2d'],
                     'cond_vec': state_dict['cond_vec'],
@@ -468,7 +443,6 @@ def async_environment_worker(worker_id, model_queue, trajectory_queue, steps_to_
             if pending_transition is not None:
                 accumulated_reward += float(step_reward)
             
-            # --- 終局処理 ---
             if done:
                 if pending_transition is not None:
                     pending_transition['reward'] = accumulated_reward
@@ -480,7 +454,6 @@ def async_environment_worker(worker_id, model_queue, trajectory_queue, steps_to_
                 pending_transition = None
                 next_state_dict, next_mask, next_player = env.reset()
                 
-                # 【CRITICAL FIX】: 终局处理完成后，若步数达标立刻中止，确保 Chunk 大小严格一致。
                 if steps_collected >= steps_to_collect:
                     state_dict, mask, current_player = next_state_dict, next_mask, next_player
                     break
@@ -519,12 +492,8 @@ class PPOKLPenaltyTrainer:
         self.buffer = PPOBuffer()
 
     def update_from_buffer(self, mini_batch_size=256):
-        """
-        ミニバッチ学習(Mini-batch learning)を導入し、OOMと急激な負荷スパイクを防止。
-        （引入小批次更新，防止显存溢出及极端的计算负载尖刺）
-        """
         if len(self.buffer.rewards) == 0:
-            return 0.0
+            return 0.0, 0.0 # 【変更】 報酬がない場合はタプル (0.0, 0.0) を返す
 
         self.model.train()
         s_2d = torch.tensor(np.array(self.buffer.states_2d), dtype=torch.float32, device=self.device)
@@ -542,7 +511,6 @@ class PPOKLPenaltyTrainer:
         steps_per_worker = 256 
         num_workers = len(rewards) // steps_per_worker
         
-        # 複数のワーカーの軌跡が混ざらないようにチャンクごとに計算 (按Worker分块计算，避免轨迹污染)
         for w in range(num_workers):
             start_idx = w * steps_per_worker
             end_idx = start_idx + steps_per_worker
@@ -561,9 +529,7 @@ class PPOKLPenaltyTrainer:
                 else:
                     v_next = w_values[t + 1]
                 
-                # TD誤差 (TD Error)
                 delta = w_rewards[t] + self.gamma * v_next * (1 - w_dones[t]) - w_values[t]
-                # 広義アドバンテージ推定 (GAE Accumulation)
                 gae = delta + self.gamma * self.gae_lambda * (1 - w_dones[t]) * gae
                 w_advantages.insert(0, gae)
                 
@@ -581,13 +547,13 @@ class PPOKLPenaltyTrainer:
         one_hot_actions = (actions.unsqueeze(1) == classes).to(torch.float32)
 
         total_ppo_loss = 0.0
+        total_entropy_val = 0.0 # 【追加】 エントロピー（Entropy）の累積値
         batch_size = len(rewards)
         indices = np.arange(batch_size)
         num_updates = 0
         
-        # 1536条数据切分为 mini_batch_size (256) 的小批次，减小 DirectML 压力
         for _ in range(self.ppo_epochs):
-            np.random.shuffle(indices) # シャッフル (洗牌以保证梯度稳定性)
+            np.random.shuffle(indices) 
             
             for start_idx in range(0, batch_size, mini_batch_size):
                 end_idx = start_idx + mini_batch_size
@@ -603,7 +569,6 @@ class PPOKLPenaltyTrainer:
                 mb_returns = returns[mb_indices]
                 mb_old_values = old_values_tensor[mb_indices]
                 
-                # --- フォワードパス (前向传播) ---
                 p_disc, _, _, v_score, _, _ = self.model(mb_s_2d, mb_c_vec, mb_seq_h)
                 new_values = v_score.squeeze(-1)
                 p_disc_masked = p_disc + (1.0 - mb_masks) * -1e9
@@ -614,9 +579,10 @@ class PPOKLPenaltyTrainer:
                     sl_disc_masked = sl_disc + (1.0 - mb_masks) * -1e9
                     sl_probs = F.softmax(sl_disc_masked, dim=-1)
                 
-                # --- ロス計算 (损失计算) ---
                 log_probs_all = torch.log(new_probs + 1e-8)
                 new_log_probs = (log_probs_all * mb_one_hot_actions).sum(dim=-1)
+                
+                # エントロピー計算
                 entropy = -(new_probs * log_probs_all).sum(dim=-1).mean()
                 
                 log_diff = torch.clamp(new_log_probs - mb_old_log_probs, -5.0, 5.0)
@@ -637,21 +603,33 @@ class PPOKLPenaltyTrainer:
                 
                 total_loss = policy_loss + 1.0 * value_loss - 0.01 * entropy + self.kl_beta * kl_div
                 
-                # --- バックプロパゲーション (反向传播) ---
                 self.optimizer.zero_grad()
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
                 
                 total_ppo_loss += total_loss.item()
+                total_entropy_val += entropy.item() # 【追加】 エントロピー累積
                 num_updates += 1
             
         self.buffer.clear()
-        return total_ppo_loss / num_updates if num_updates > 0 else 0.0
+        
+        # 【変更】 PPO Loss と Entropy の平均値をタプルとして返す
+        if num_updates > 0:
+            return total_ppo_loss / num_updates, total_entropy_val / num_updates
+        else:
+            return 0.0, 0.0
 
-def save_rl_training_curve(loss_history, reward_history, chart_path='rl_training_curve.png'):
-    plt.figure(figsize=(12, 5))
-    plt.subplot(1, 2, 1)
+# ==========================================
+# 【変更】学習曲線の可視化機能 (Training Curve Visualization)
+# エントロピー曲線を追加し、1行3列のレイアウトに変更
+# ==========================================
+def save_rl_training_curve(loss_history, reward_history, entropy_history, chart_path='rl_training_curve.png'):
+    # 画像サイズを横長に拡張して3つのグラフを収容
+    plt.figure(figsize=(18, 5))
+    
+    # 1. PPO Loss グラフ
+    plt.subplot(1, 3, 1)
     plt.plot(loss_history, label='PPO Loss', color='purple')
     plt.xlabel('Iteration')
     plt.ylabel('Loss')
@@ -659,11 +637,21 @@ def save_rl_training_curve(loss_history, reward_history, chart_path='rl_training
     plt.legend()
     plt.grid(True)
     
-    plt.subplot(1, 2, 2)
+    # 2. Avg Reward グラフ
+    plt.subplot(1, 3, 2)
     plt.plot(reward_history, label='Avg Reward', color='darkorange')
     plt.xlabel('Iteration')
     plt.ylabel('Reward')
     plt.title('Multi-Agent Self-Play Reward')
+    plt.legend()
+    plt.grid(True)
+    
+    # 3. Policy Entropy グラフ (方策エントロピー/探索度合い)
+    plt.subplot(1, 3, 3)
+    plt.plot(entropy_history, label='Policy Entropy', color='teal')
+    plt.xlabel('Iteration')
+    plt.ylabel('Entropy')
+    plt.title('Policy Entropy (Exploration)')
     plt.legend()
     plt.grid(True)
     
@@ -679,7 +667,7 @@ if __name__ == '__main__':
     mp.set_start_method('spawn', force=True)
     
     print("="*50)
-    print("🚀 PPO Multi-Agent Self-Play Pipeline (4-Player)") 
+    print("🚀 PPO Multi-Agent Self-Play Pipeline (4-Player) - Phase 1 (Re-Run)") 
     print("="*50)
     
     NUM_WORKERS = 10                 
@@ -695,19 +683,20 @@ if __name__ == '__main__':
     model = SmartMahjongMultiTaskNet()
     sl_base_model = SmartMahjongMultiTaskNet()
     
+    # Phase 1の再実行：常に監督学習（SL）のベースモデルを起点とする
     base_policy_path = "smart_mahjong_base_policy.pth"
     if os.path.exists(base_policy_path):
         sl_base_model.load_state_dict(torch.load(base_policy_path, map_location='cpu', weights_only=False))
         model.load_state_dict(torch.load(base_policy_path, map_location='cpu', weights_only=False))
         print(f" -> [Info] SLベースポリシーを読み込みました: {base_policy_path}")
     
+    # Phase 1 学習率 (1e-4) を使用
     trainer = PPOKLPenaltyTrainer(model, sl_base_model, device, lr=1e-4, kl_beta=0.05)
     pool_manager = OpponentPoolManager(base_policy_path)
     
     trajectory_queue = mp.Queue()
     model_queues = [mp.Queue() for _ in range(NUM_WORKERS)]
     
-    # ========= 替换为以下新代码 =========
     sync_model_path = "sync_current_model.pth"
     torch.save(model.state_dict(), sync_model_path)
     initial_opps = pool_manager.sample_opponent_paths()
@@ -717,11 +706,11 @@ if __name__ == '__main__':
         p = mp.Process(target=async_environment_worker, args=(i, model_queues[i], trajectory_queue, STEPS_PER_WORKER, base_policy_path))
         p.start()
         workers.append(p)
-        model_queues[i].put(("SYNC", initial_opps)) # 只发送轻量级字符串指令
-    # ==================================
+        model_queues[i].put(("SYNC", initial_opps)) 
     
     ppo_loss_history = []
     reward_history = []
+    entropy_history = [] # 【追加】 エントロピー追跡用リスト
     best_avg_reward = -float('inf')
 
     try:
@@ -729,13 +718,11 @@ if __name__ == '__main__':
             collected_steps = 0
             iteration_reward = 0.0
             
-# ======== 请用这段代码替换原有的 rollout_pbar 收集循环 ========
             rollout_pbar = tqdm(total=TARGET_BUFFER_SIZE, desc=f"Iter [{it}/{TOTAL_ITERATIONS}] Rollout", leave=False)
             while collected_steps < TARGET_BUFFER_SIZE:
                 chunk = trajectory_queue.get()
                 added_steps = 0
                 for step_data in chunk:
-                    # 【防御的プログラミング】: 强制拦截多余数据，绝对防止 PPO 训练维度不一致
                     if len(trainer.buffer.rewards) >= TARGET_BUFFER_SIZE:
                         break 
                         
@@ -754,16 +741,19 @@ if __name__ == '__main__':
                 collected_steps += added_steps
                 rollout_pbar.update(added_steps)
             rollout_pbar.close()
-            # ==============================================================
             
             update_pbar = tqdm(total=trainer.ppo_epochs, desc=f"Iter [{it}/{TOTAL_ITERATIONS}] Optim  ", leave=False)
-            ppo_loss = trainer.update_from_buffer(mini_batch_size=512) 
+            
+            # 【変更】 PPO LossとEntropyの2つの戻り値を受け取る
+            ppo_loss, avg_entropy = trainer.update_from_buffer(mini_batch_size=512) 
+            
             update_pbar.update(trainer.ppo_epochs)
             update_pbar.close()
             
             avg_reward = iteration_reward / TARGET_BUFFER_SIZE
             ppo_loss_history.append(ppo_loss)
             reward_history.append(avg_reward)
+            entropy_history.append(avg_entropy) # 【追加】 履歴リストに記録
 
             if avg_reward > best_avg_reward:
                 best_avg_reward = avg_reward
@@ -772,18 +762,14 @@ if __name__ == '__main__':
                 print(f"     [*] 新的最高奖励！已更新最优模型存档 -> {best_path} (Reward: {avg_reward:.4f})")
                 pool_manager.add_peak_history(trainer.model.state_dict(), it, avg_reward)
 
-            # ========= 替换为以下新代码 =========
-            # 将最新权重覆盖保存到硬盘，避免挤爆 Windows IPC 管道
             torch.save(trainer.model.state_dict(), sync_model_path)
             new_opps = pool_manager.sample_opponent_paths()
                 
             for q in model_queues:
                 q.put(("SYNC", new_opps))
-            # ==================================
-                
-            # --- 【修正済み】: 重複していた appended コードブロックを削除 ---
             
-            print(f"✅ Iter [{it:04d}/{TOTAL_ITERATIONS}] | PPO Loss: {ppo_loss:.4f} | Avg Step Reward: {avg_reward:.4f}")
+            # 【変更】 ターミナル出力に Entropy を追加
+            print(f"✅ Iter [{it:04d}/{TOTAL_ITERATIONS}] | PPO Loss: {ppo_loss:.4f} | Avg Step Reward: {avg_reward:.4f} | Entropy: {avg_entropy:.4f}")
 
     except KeyboardInterrupt:
         print("\n[Warn] 訓練がユーザーによって中断されました。(Training interrupted by user.)")
@@ -796,5 +782,6 @@ if __name__ == '__main__':
             if p.is_alive():
                 p.terminate()
                 
-        save_rl_training_curve(ppo_loss_history, reward_history)
+        # 【変更】 グラフ出力関数に entropy_history を引数として渡す
+        save_rl_training_curve(ppo_loss_history, reward_history, entropy_history, chart_path='rl_training_curve.png')
         print("🎉 自己対局パイプラインの実行が完了しました。(Pipeline finished.)")

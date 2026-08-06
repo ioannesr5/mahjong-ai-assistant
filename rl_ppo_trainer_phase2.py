@@ -490,7 +490,7 @@ class PPOKLPenaltyTrainer:
 
     def update_from_buffer(self, mini_batch_size=256):
         if len(self.buffer.rewards) == 0:
-            return 0.0
+            return 0.0, 0.0 # 【変更】 報酬がない場合はタプル (0.0, 0.0) を返す[cite: 5]
 
         self.model.train()
         s_2d = torch.tensor(np.array(self.buffer.states_2d), dtype=torch.float32, device=self.device)
@@ -544,6 +544,7 @@ class PPOKLPenaltyTrainer:
         one_hot_actions = (actions.unsqueeze(1) == classes).to(torch.float32)
 
         total_ppo_loss = 0.0
+        total_entropy_val = 0.0 # 【追加】 エントロピー（Entropy）の累積値[cite: 5]
         batch_size = len(rewards)
         indices = np.arange(batch_size)
         num_updates = 0
@@ -577,6 +578,8 @@ class PPOKLPenaltyTrainer:
                 
                 log_probs_all = torch.log(new_probs + 1e-8)
                 new_log_probs = (log_probs_all * mb_one_hot_actions).sum(dim=-1)
+                
+                # エントロピー計算
                 entropy = -(new_probs * log_probs_all).sum(dim=-1).mean()
                 
                 log_diff = torch.clamp(new_log_probs - mb_old_log_probs, -5.0, 5.0)
@@ -603,14 +606,26 @@ class PPOKLPenaltyTrainer:
                 self.optimizer.step()
                 
                 total_ppo_loss += total_loss.item()
+                total_entropy_val += entropy.item() # 【追加】 エントロピー累積[cite: 5]
                 num_updates += 1
             
         self.buffer.clear()
-        return total_ppo_loss / num_updates if num_updates > 0 else 0.0
+        
+        # 【変更】 PPO Loss と Entropy の平均値をタプルとして返す[cite: 5]
+        if num_updates > 0:
+            return total_ppo_loss / num_updates, total_entropy_val / num_updates
+        else:
+            return 0.0, 0.0
 
-def save_rl_training_curve(loss_history, reward_history, chart_path='rl_training_curve_phase2.png'): # 【変更】 Phase2用の出力ファイル名に変更 (修改为Phase2专用的图表名称以防覆盖)
-    plt.figure(figsize=(12, 5))
-    plt.subplot(1, 2, 1)
+# ==========================================
+# 【変更】学習曲線の可視化機能 (Training Curve Visualization)
+# Phase2用の3分割グラフ出力関数 (Loss, Reward, Entropy)
+# ==========================================
+def save_rl_training_curve(loss_history, reward_history, entropy_history, chart_path='rl_training_curve_phase2.png'):
+    plt.figure(figsize=(18, 5))
+    
+    # 1. PPO Loss グラフ
+    plt.subplot(1, 3, 1)
     plt.plot(loss_history, label='PPO Loss', color='purple')
     plt.xlabel('Iteration')
     plt.ylabel('Loss')
@@ -618,11 +633,21 @@ def save_rl_training_curve(loss_history, reward_history, chart_path='rl_training
     plt.legend()
     plt.grid(True)
     
-    plt.subplot(1, 2, 2)
+    # 2. Avg Reward グラフ
+    plt.subplot(1, 3, 2)
     plt.plot(reward_history, label='Avg Reward', color='darkorange')
     plt.xlabel('Iteration')
     plt.ylabel('Reward')
     plt.title('Multi-Agent Self-Play Reward')
+    plt.legend()
+    plt.grid(True)
+    
+    # 3. Policy Entropy グラフ (方策エントロピー/探索度合い)
+    plt.subplot(1, 3, 3)
+    plt.plot(entropy_history, label='Policy Entropy', color='teal')
+    plt.xlabel('Iteration')
+    plt.ylabel('Entropy')
+    plt.title('Policy Entropy (Exploration)')
     plt.legend()
     plt.grid(True)
     
@@ -655,15 +680,14 @@ if __name__ == '__main__':
     sl_base_model = SmartMahjongMultiTaskNet()
     
     # 【変更】 Phase1の最終状態である同期モデルをベースポリシーとして読み込む 
-    # (修改：加载第一阶段最后一刻的同步模型权重作为断点继续训练的基础)
+    # (修改：加载第一阶段最后一刻的同步模型权重作为断点继续训练的基础)[cite: 5]
     base_policy_path = "sync_current_model.pth"
     if os.path.exists(base_policy_path):
         sl_base_model.load_state_dict(torch.load(base_policy_path, map_location='cpu', weights_only=False))
         model.load_state_dict(torch.load(base_policy_path, map_location='cpu', weights_only=False))
         print(f" -> [Info] RLフェーズ1のポリシーを読み込みました: {base_policy_path}")
     
-    # 【変更】 微調整のため、学習率を1e-4から5e-5に減衰させる 
-    # (修改：为了第二阶段的精细微调，将学习率降低至 5e-5)
+    # 【変更】 微調整のため、学習率を1e-4から5e-5に減衰させる[cite: 5]
     trainer = PPOKLPenaltyTrainer(model, sl_base_model, device, lr=5e-5, kl_beta=0.05)
     pool_manager = OpponentPoolManager(base_policy_path)
     
@@ -683,6 +707,7 @@ if __name__ == '__main__':
     
     ppo_loss_history = []
     reward_history = []
+    entropy_history = [] # 【追加】 エントロピー履歴用リスト[cite: 5]
     best_avg_reward = -float('inf')
 
     try:
@@ -715,18 +740,20 @@ if __name__ == '__main__':
             rollout_pbar.close()
             
             update_pbar = tqdm(total=trainer.ppo_epochs, desc=f"Iter [{it}/{TOTAL_ITERATIONS}] Optim  ", leave=False)
-            ppo_loss = trainer.update_from_buffer(mini_batch_size=512) 
+            
+            # 【変更】 PPO Loss と Entropy の2つの戻り値を受け取る[cite: 5]
+            ppo_loss, avg_entropy = trainer.update_from_buffer(mini_batch_size=512) 
+            
             update_pbar.update(trainer.ppo_epochs)
             update_pbar.close()
             
             avg_reward = iteration_reward / TARGET_BUFFER_SIZE
             ppo_loss_history.append(ppo_loss)
             reward_history.append(avg_reward)
+            entropy_history.append(avg_entropy) # 【追加】 エントロピー履歴を記録[cite: 5]
 
             if avg_reward > best_avg_reward:
                 best_avg_reward = avg_reward
-                # 【変更】 Phase1の最高記録を上書きしないよう、保存先ファイル名を変更 
-                # (修改：更改保存名称，防止覆盖第一阶段的历史最高记录点)
                 best_path = "smart_mahjong_ppo_best_phase2.pth"
                 torch.save(trainer.model.state_dict(), best_path)
                 print(f"     [*] 新的最高奖励！已更新最优模型存档 -> {best_path} (Reward: {avg_reward:.4f})")
@@ -738,7 +765,8 @@ if __name__ == '__main__':
             for q in model_queues:
                 q.put(("SYNC", new_opps))
             
-            print(f"✅ Iter [{it:04d}/{TOTAL_ITERATIONS}] | PPO Loss: {ppo_loss:.4f} | Avg Step Reward: {avg_reward:.4f}")
+            # 【変更】 ターミナルログに Entropy を追加表示[cite: 5]
+            print(f"✅ Iter [{it:04d}/{TOTAL_ITERATIONS}] | PPO Loss: {ppo_loss:.4f} | Avg Step Reward: {avg_reward:.4f} | Entropy: {avg_entropy:.4f}")
 
     except KeyboardInterrupt:
         print("\n[Warn] 訓練がユーザーによって中断されました。(Training interrupted by user.)")
@@ -751,6 +779,6 @@ if __name__ == '__main__':
             if p.is_alive():
                 p.terminate()
                 
-        # 終了時にPhase2専用のグラフを出力 (结束时输出 Phase2 专用的训练曲线图表)
-        save_rl_training_curve(ppo_loss_history, reward_history, chart_path='rl_training_curve_phase2.png')
+        # 【変更】 終了時にエントロピー履歴を含めてPhase2用の3分割グラフを出力[cite: 5]
+        save_rl_training_curve(ppo_loss_history, reward_history, entropy_history, chart_path='rl_training_curve_phase2.png')
         print("🎉 自己対局パイプラインの実行が完了しました。(Pipeline finished.)")
