@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
 import torch.multiprocessing as mp
 import numpy as np
 import os
@@ -9,10 +8,12 @@ import random
 import time
 import math
 import matplotlib.pyplot as plt
-import torch_directml  # AMD GPU 用 DirectML バックエンド
-from tqdm import tqdm  # 端末プログレスバー用
+from tqdm import tqdm
 import pymahjong # type: ignore
+import gc
 
+from torch.optim.optimizer import Optimizer
+import torch_directml
 
 # CPUスレッドの爆発を防ぐ環境変数設定 (防止 CPU 线程爆炸)
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -21,15 +22,9 @@ os.environ["MKL_NUM_THREADS"] = "1"
 # ==========================================
 # 1. カスタムオプティマイザ (DirectML Safe AdamW)
 # ==========================================
-from torch.optim.optimizer import Optimizer
-
 class DirectMLSafeAdamW(Optimizer):
-    """
-    DirectML環境下での 'aten::lerp' CPUフォールバックを完全に回避するためのカスタムAdamW。
-    """
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2):
-        if lr < 0.0:
-            raise ValueError(f"Invalid learning rate: {lr}")
+        if lr < 0.0: raise ValueError(f"Invalid learning rate: {lr}")
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super(DirectMLSafeAdamW, self).__init__(params, defaults)
 
@@ -37,13 +32,11 @@ class DirectMLSafeAdamW(Optimizer):
     def step(self, closure=None):
         loss = None
         if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+            with torch.enable_grad(): loss = closure()
 
         for group in self.param_groups:
             for p in group['params']:
-                if p.grad is None:
-                    continue
+                if p.grad is None: continue
                 grad = p.grad
                 state = self.state[p]
                 if len(state) == 0:
@@ -68,11 +61,10 @@ class DirectMLSafeAdamW(Optimizer):
         return loss
 
 # ==========================================
-# 2. ネットワーク構成要素 (Network Components)
+# 2. ネットワーク構成要素 (SmartMahjongMultiTaskNet V2)
 # ==========================================
-
 class FiLMResBlock2D(nn.Module):
-    def __init__(self, channels, cond_dim, dropout_p=0.15):
+    def __init__(self, channels, cond_dim, dropout_p=0.15, res_scale=0.1):
         super(FiLMResBlock2D, self).__init__()
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(channels)
@@ -80,6 +72,7 @@ class FiLMResBlock2D(nn.Module):
         self.bn2 = nn.BatchNorm2d(channels)
         self.dropout = nn.Dropout2d(p=dropout_p)
         self.film_gen = nn.Linear(cond_dim, channels * 2)
+        self.res_scale = res_scale
 
     def forward(self, x, cond):
         residual = x
@@ -89,8 +82,7 @@ class FiLMResBlock2D(nn.Module):
         film_params = self.film_gen(cond).view(x.size(0), -1, 1, 1)
         gamma, beta = film_params.chunk(2, dim=1)
         out = (1.0 + gamma) * out + beta
-        out += residual
-        return F.relu(out)
+        return F.relu((out * self.res_scale) + residual)
 
 class DirectMLSafeTransformerLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1):
@@ -137,14 +129,28 @@ class DiscardSequenceEncoder(nn.Module):
         out = self.embedding(x) + self.pos_embedding[:, :seq_len, :]
         for layer in self.layers:
             out = layer(out)
-        return out[:, -1, :] 
+        return out
+
+class MahjongBeliefCrossAttention(nn.Module):
+    def __init__(self, cnn_dim=1024, seq_dim=256, num_heads=8, dropout_p=0.1):
+        super(MahjongBeliefCrossAttention, self).__init__()
+        self.cross_attn = nn.MultiheadAttention(embed_dim=cnn_dim, kdim=seq_dim, vdim=seq_dim, num_heads=num_heads, dropout=dropout_p, batch_first=True)
+        self.norm = nn.LayerNorm(cnn_dim)
+        self.dropout = nn.Dropout(dropout_p)
+
+    def forward(self, cnn_query, seq_kv):
+        q = cnn_query.unsqueeze(1)
+        attn_out, _ = self.cross_attn(q, seq_kv, seq_kv)
+        return self.norm(cnn_query + self.dropout(attn_out.squeeze(1)))
 
 class SmartMahjongMultiTaskNet(nn.Module):
-    def __init__(self, input_channels=128, cond_dim=16, seq_vocab=273, num_blocks=10, dropout_p=0.30):
+    def __init__(self, input_channels=256, cond_dim=16, seq_vocab=273, num_blocks=18, dropout_p=0.30):
         super(SmartMahjongMultiTaskNet, self).__init__()
         self.conv_init = nn.Conv2d(input_channels, 256, kernel_size=3, padding=1, bias=False)
         self.bn_init = nn.BatchNorm2d(256)
-        self.res_blocks = nn.ModuleList([FiLMResBlock2D(256, cond_dim, dropout_p) for _ in range(num_blocks)])
+        self.res_blocks = nn.ModuleList([
+            FiLMResBlock2D(256, cond_dim, dropout_p, res_scale=0.1) for _ in range(num_blocks)
+        ])
         
         self.cnn_proj = nn.Sequential(
             nn.Linear(256 * 4 * 9, 1024),
@@ -153,21 +159,30 @@ class SmartMahjongMultiTaskNet(nn.Module):
         )
         
         self.seq_encoder = DiscardSequenceEncoder(vocab_size=seq_vocab, embed_dim=256, num_heads=8, num_layers=4)
+        self.cross_attention = MahjongBeliefCrossAttention(cnn_dim=1024, seq_dim=256, num_heads=8, dropout_p=dropout_p)
         
-        fused_dim = 1024 + 256
         self.fusion_fc = nn.Sequential(
-            nn.Linear(fused_dim, 1024),
+            nn.Linear(1024, 1024),
             nn.LayerNorm(1024),
             nn.ReLU(inplace=True),
             nn.Dropout(p=dropout_p)
         )
-        self.policy_discard = nn.Linear(1024, 34)
-        self.policy_action = nn.Linear(1024, 6)
-        self.policy_riichi = nn.Linear(1024, 2)
+        
+        # 【核心修正】: 将分层动作头合并为 47 维的统一策略头
+        self.policy_out = nn.Linear(1024, 47)
         self.value_head = nn.Linear(1024, 1)
         
-        self.aux_tenpai = nn.Linear(1024, 3)     
-        self.aux_danger = nn.Linear(1024, 102)   
+        def build_aux_mlp(in_dim, out_dim):
+            return nn.Sequential(
+                nn.Linear(in_dim, 256),
+                nn.LayerNorm(256),
+                nn.ReLU(inplace=True),
+                nn.Linear(256, out_dim)
+            )
+            
+        self.aux_tenpai = build_aux_mlp(1024, 3)
+        self.aux_danger = build_aux_mlp(1024, 102)     
+        self.aux_waits  = build_aux_mlp(1024, 102)     
 
     def forward(self, state_2d, cond_vec, seq_hist, rl_mode=False):
         out = F.relu(self.bn_init(self.conv_init(state_2d)))
@@ -175,34 +190,168 @@ class SmartMahjongMultiTaskNet(nn.Module):
             out = block(out, cond_vec)
         out_flat = out.view(out.size(0), -1)
         
-        cnn_feat = self.cnn_proj(out_flat)
-        seq_feat = self.seq_encoder(seq_hist) 
-        fused = torch.cat([cnn_feat, seq_feat], dim=1) 
+        cnn_query = self.cnn_proj(out_flat)
+        seq_kv = self.seq_encoder(seq_hist) 
+        fused = self.cross_attention(cnn_query, seq_kv)
         hidden = self.fusion_fc(fused)
         
-        p_disc = self.policy_discard(hidden).to(torch.float32)
-        p_act = self.policy_action(hidden).to(torch.float32)
-        p_riichi = self.policy_riichi(hidden).to(torch.float32)
+        # 【核心修正】: 直接输出 47 维 Logits
+        p_out = self.policy_out(hidden).to(torch.float32)
         v_head = self.value_head(hidden).to(torch.float32)
         
         if rl_mode:
-            aux_t = torch.empty(0, device=hidden.device)
-            aux_d = torch.empty(0, device=hidden.device)
+            hidden_aux = hidden.detach() 
         else:
-            aux_t = self.aux_tenpai(hidden).to(torch.float32)
-            aux_d = self.aux_danger(hidden).to(torch.float32)
+            hidden_aux = hidden
+            
+        aux_t = self.aux_tenpai(hidden_aux).to(torch.float32)
+        aux_d = self.aux_danger(hidden_aux).to(torch.float32)
+        aux_w = self.aux_waits(hidden_aux).to(torch.float32)
 
-        return p_disc, p_act, p_riichi, v_head, aux_t, aux_d
+        return p_out, v_head, aux_t, aux_d, aux_w
 
 # ==========================================
-# 3. マルチエージェント自己対局環境 (Multi-Agent Self-Play Environment)
+# RL スクリプトの Wrapper も合わせて修正
 # ==========================================
+class PolicyInferenceWrapper(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+    def forward(self, state_2d, cond_vec, seq_hist):
+        p_out, v_head, _, _, _ = self.model(state_2d, cond_vec, seq_hist, True)
+        return p_out, v_head
+# ==========================================
+# 3. マルチエージェント自己対局環境 (V2 半庄順位計算対応)
+# ==========================================
+def decode_obs_93_to_256(obs_93: np.ndarray, self_scores: np.ndarray, p_id: int) -> np.ndarray:
+    """
+    [超高速ベクトル化ブリッジ]
+    pymahjong のネイティブな 93x34 観測行列を直接解読し、
+    V2 の 256x34 テンソルへゼロオーバーヘッドで変換する。
+    """
+    state = np.zeros((256, 34), dtype=np.float32)
+    
+    # ==========================================
+    # 0~6: 自家手牌 (Hand & Red Dora) 
+    # ==========================================
+    state[0:4] = obs_93[0:4]          # 1枚~4枚の所持フラグ #[cite: 17]
+    state[4, 4] = obs_93[5, 4]        # 5m 赤ドラ #[cite: 17]
+    state[5, 13] = obs_93[5, 13]      # 5p 赤ドラ #[cite: 17]
+    state[6, 22] = obs_93[5, 22]      # 5s 赤ドラ #[cite: 17]
+
+    # ==========================================
+    # 7~54: 四家副露 (Callings) 
+    # ==========================================
+    for i in range(4):
+        ob_base = 6 + i * 6           # obs: 6~11, 12~17, 18~23, 24~29 #[cite: 17]
+        st_base = 7 + i * 12
+        state[st_base : st_base + 4] = obs_93[ob_base : ob_base + 4] # 副露枚数 #[cite: 17]
+        
+        # 副露内のドラ (obs 74~77 がドラ情報) 
+        is_dora = np.clip(obs_93[74] + obs_93[75] + obs_93[76] + obs_93[77], 0, 1) #[cite: 17]
+        state[st_base + 10] = obs_93[ob_base] * is_dora
+        
+        # 副露内の赤ドラ 
+        state[st_base + 11] = obs_93[ob_base + 5] #[cite: 17]
+
+    # ==========================================
+    # 55~150: 四家捨て牌 (Discards & Tegiri/Riichi) 
+    # ==========================================
+    for i in range(4):
+        ob_base = 30 + i * 10         # obs: 30~39, 40~49, 50~59, 60~69 #[cite: 17]
+        st_base = 55 + i * 24
+        
+        # 34~37 は手切り(Tegiri) 
+        tegiri = obs_93[ob_base + 4 : ob_base + 8] #[cite: 17]
+        state[st_base : st_base + 4] = tegiri
+        
+        # 30~33 は捨て牌全体(Total discards) 
+        total_disc = obs_93[ob_base : ob_base + 4] #[cite: 17]
+        # ツモ切り = 全体 - 手切り (Tsumogiri = Total - Tegiri)
+        state[st_base + 4 : st_base + 8] = np.clip(total_disc - tegiri, 0, 1)
+        
+        # 39 は立直宣言牌 
+        state[st_base + 8] = obs_93[ob_base + 9] #[cite: 17]
+        
+        # 立直後の牌は厳密なターン計測がないためダミー化するか近似
+        state[st_base + 9 : st_base + 13] = np.clip(total_disc - obs_93[ob_base + 9], 0, 1)
+
+    # ==========================================
+    # 151~170: ドラ表示牌 (Dora Indicators) 
+    # ==========================================
+    state[151:155] = obs_93[70:74]    # 70~73: ドラ表示牌の枚数 #[cite: 17]
+
+    # ==========================================
+    # 171~210: 防守マトリックス (Defense Matrix: Suji/Kabe)
+    # ==========================================
+    # 全可視牌のカウント (Visible counts)
+    vis = obs_93[0] + obs_93[6] + obs_93[12] + obs_93[18] + obs_93[24] + \
+          obs_93[30] + obs_93[40] + obs_93[50] + obs_93[60] + obs_93[70] #[cite: 17]
+    vis = np.clip(vis, 0, 4)
+
+    for i in range(4):
+        ob_base = 30 + i * 10 #[cite: 17]
+        st_base = 171 + i * 10
+        
+        # 現物 (Genbutsu): 当該プレイヤーが捨てた牌 
+        genbutsu = obs_93[ob_base] > 0 #[cite: 17]
+        state[st_base + 0] = genbutsu
+        
+        # 高速ベクトル化された筋(Suji)と壁(Kabe)の推論
+        for suit in range(3):
+            off = suit * 9
+            # 筋牌 (1-4-7, 2-5-8, 3-6-9)
+            state[st_base+1, off+0] = genbutsu[off+3] # 1m
+            state[st_base+1, off+1] = genbutsu[off+4] # 2m
+            state[st_base+1, off+2] = genbutsu[off+5] # 3m
+            state[st_base+1, off+3] = genbutsu[off+0] * genbutsu[off+6] # 4m
+            state[st_base+1, off+4] = genbutsu[off+1] * genbutsu[off+7] # 5m
+            state[st_base+1, off+5] = genbutsu[off+2] * genbutsu[off+8] # 6m
+            state[st_base+1, off+6] = genbutsu[off+3] # 7m
+            state[st_base+1, off+7] = genbutsu[off+4] # 8m
+            state[st_base+1, off+8] = genbutsu[off+5] # 9m
+
+            # 壁牌 (ノーチャンス / 4枚見え)
+            state[st_base+2, off+0] = (vis[off+1] == 4)
+            state[st_base+2, off+1] = (vis[off+2] == 4)
+            state[st_base+2, off+2] = np.maximum(vis[off+1]==4, vis[off+3]==4)
+            state[st_base+2, off+6] = np.maximum(vis[off+5]==4, vis[off+7]==4)
+            state[st_base+2, off+7] = (vis[off+6] == 4)
+            state[st_base+2, off+8] = (vis[off+7] == 4)
+
+        # 無筋危険マスク (Musuji mask)
+        is_safe = np.clip(state[st_base] + state[st_base+1] + state[st_base+2], 0, 1)
+        state[st_base+3, 0:27] = 1.0 - is_safe[0:27]
+
+        # 生牌の字牌 (Unseen honors)
+        for honor in range(27, 34):
+            if vis[honor] == 0:
+                state[st_base+4, honor] = 1.0
+
+    # ==========================================
+    # 211~255: 局勢コンテキスト (Global Context)
+    # ==========================================
+    # 78: Table wind, 79: Self wind 
+    rw = np.argmax(obs_93[78]) if np.any(obs_93[78]) else 0 #[cite: 17]
+    sw = np.argmax(obs_93[79]) if np.any(obs_93[79]) else 0 #[cite: 17]
+    state[211, :] = rw / 3.0
+    state[212, :] = sw / 3.0
+    
+    # 自身を基準とした点数差
+    my_score = self_scores[p_id]
+    for i in range(4):
+        diff = (self_scores[i] - my_score) / 100000.0
+        state[216 + i, :] = diff
+
+    # (256, 34) -> パディング -> (256, 4, 9) の 2D空間テンソルへ変形
+    padded = np.pad(state, ((0,0), (0,2)), mode='constant')
+    return padded.reshape(256, 4, 9)
+
 
 class MultiAgentMahjongEnvWrapper:
     """
-    リアルな日本麻雀ルールに基づく、マルチエージェント対応の半荘戦シミュレータ。
-    （基于真实日本麻将规则的多智能体半庄战环境包装器）
-    【注意】: 冗長なゴーストコード（幽灵代码）は完全に削除済みです。
+    [更新版] Python API の限界を破り、C++層の93次元マトリックスから
+    V2 の256次元完全テンソルを逆算・復元する超高速ラッパー。
     """
     def __init__(self):
         self.env = pymahjong.MahjongEnv()
@@ -212,10 +361,8 @@ class MultiAgentMahjongEnvWrapper:
         return self.reset_hanchan()
 
     def reset_hanchan(self):
+        # 4家のスコア状態をここで維持
         self.scores = np.array([25000, 25000, 25000, 25000], dtype=np.float32)
-        self.round_wind = 0  
-        self.round_num = 1   
-        self.dealer = 0      
         return self.reset_hand()
 
     def reset_hand(self):
@@ -230,11 +377,10 @@ class MultiAgentMahjongEnvWrapper:
         reward = 0.0
         
         if action_id not in valid_actions:
-            if p == 0:
-                reward -= 1.0
+            if p == 0: reward -= 1.0
             return self._get_state_dict(), self._get_mask(), reward, True, p
 
-        # 履歴記録 (记录动作到牌谱序列)
+        # 履歴記録 (seq_hist 用に全プレイヤーのアクションを追跡)
         if action_id < 34: 
             self.action_history.append((p, action_id))
 
@@ -243,7 +389,20 @@ class MultiAgentMahjongEnvWrapper:
         
         if done:
             payoffs = self.env.get_payoffs()
-            reward = float(payoffs[0]) / 1000.0
+            
+            # 局終わりに内部スコアを更新
+            for i in range(4):
+                self.scores[i] += float(payoffs[i])
+            
+            # 順位報酬の計算 (Rank Bonus)
+            base_reward = float(payoffs[0]) / 1000.0
+            my_payoff = payoffs[0]
+            rank = sum(1 for x in payoffs if x > my_payoff)
+            
+            rank_bonuses = [1.0, 0.2, -0.3, -0.9]
+            bonus = rank_bonuses[min(rank, 3)]
+            
+            reward = base_reward + bonus
             self.current_player = p
         else:
             self.current_player = self.env.get_curr_player_id()
@@ -251,221 +410,162 @@ class MultiAgentMahjongEnvWrapper:
         return self._get_state_dict(), self._get_mask(), reward, done, self.current_player
 
     def _get_state_dict(self):
+        if self.env.is_over():
+            return { 
+                'state_2d': np.zeros((256, 4, 9), dtype=np.float32), 
+                'cond_vec': np.zeros(16, dtype=np.float32), 
+                'seq_hist': np.full(72, 272, dtype=np.int64) 
+            }
+
         p = self.current_player
         
+        # 1. C++層から [93, 34] のネイティブ観測を取得
+        obs_93 = self.env.get_obs(p)
+        
+        # 2. 超高速デコーダーで [256, 4, 9] へ逆算変換
+        state_2d = decode_obs_93_to_256(obs_93, self.scores, p)
+
+        # 3. 条件ベクトル (16次元) の構築
+        cond_vec = np.zeros(16, dtype=np.float32)
+        rw = np.argmax(obs_93[78]) if np.any(obs_93[78]) else 0 #[cite: 17]
+        sw = np.argmax(obs_93[79]) if np.any(obs_93[79]) else 0 #[cite: 17]
+        cond_vec[4 + rw] = 1.0
+        cond_vec[8 + sw] = 1.0
+        for i in range(4):
+            rel_idx = (p + i) % 4
+            cond_vec[i] = (self.scores[rel_idx] - 25000) / 10000.0
+
+        # 4. 時系列シーケンスの構築
         seq_hist = np.full(72, 272, dtype=np.int64) 
         if hasattr(self, 'action_history'):
             recent_history = self.action_history[-72:] 
             for idx, (actor_id, tile_id) in enumerate(recent_history):
                 rel_p = (actor_id - p) % 4
-                cut_type = 1 
-                token = int(tile_id) * 8 + rel_p * 2 + cut_type
+                # 手切り・ツモ切りの厳密な追跡は困難なため、近似的にカットタイプ1を設定
+                token = int(tile_id) * 8 + rel_p * 2 + 1 
                 seq_hist[idx] = min(token, 272)
                 
-        if self.env.is_over():
-            return {
-                'state_2d': np.zeros((128, 4, 9), dtype=np.float32),
-                'cond_vec': np.zeros(16, dtype=np.float32),
-                'seq_hist': seq_hist
-            }
-
-        obs = self.env.get_obs(p)
-        state_2d = np.zeros((128, 4, 9), dtype=np.float32)
-        hand_counts = np.sum(obs[0:4, :], axis=0) 
-
-        for i in range(34):
-            count = int(hand_counts[i])
-            if count > 0:
-                suit = i // 9
-                num = i % 9 if suit < 3 else i - 27
-                count = min(count, 4)
-                state_2d[0, suit, num] = float(count)
-
-        cond_vec = np.zeros(16, dtype=np.float32)
-        wind_idx = 4 + self.round_wind
-        if wind_idx < 8:
-            cond_vec[wind_idx] = 1.0
-        cond_vec[12] = (self.scores[p] - 25000.0) / 100000.0
-        cond_vec[13] = float(self.round_num) / 4.0
-
-        return {
-            'state_2d': state_2d,
-            'cond_vec': cond_vec,
-            'seq_hist': seq_hist
+        return { 
+            'state_2d': state_2d, 
+            'cond_vec': cond_vec, 
+            'seq_hist': seq_hist 
         }
 
     def _get_mask(self):
-        mask = np.zeros(34, dtype=np.float32)
+        # 【核心修正】: 47次元フルアクション空間への対応[cite: 17]
+        mask = np.zeros(47, dtype=np.float32)
         if not self.env.is_over():
             valid_actions = self.env.get_valid_actions()
             for act in valid_actions:
-                if act < 34:
-                    mask[act] = 1.0
+                if act < 47: mask[act] = 1.0
         return mask
 
 # ==========================================
-# 4. 対戦相手プール管理 (Opponent Pool Manager)
+# 4. マルチプロセス・ワーカー定義 (Asynchronous Overlapped Worker)
 # ==========================================
+def sync_params(src_model, dst_model):
+    """ 共有メモリモデルからワーカの推論モデルへの高速パラメータ同期 (Microsecond Sync) """
+    for src_p, dst_p in zip(src_model.parameters(), dst_model.parameters()):
+        dst_p.data.copy_(src_p.data)
 
-class OpponentPoolManager:
+def async_environment_worker(worker_id, shared_model, trajectory_queue, steps_to_collect):
     """
-    对手池管理器：仅收录打破历史最高纪录的巅峰版本及其里程碑。
-    """
-    def __init__(self, base_path, pool_dir="model_pool"):
-        self.pool_dir = pool_dir
-        self.base_path = base_path
-        self.history_paths = []
-        os.makedirs(self.pool_dir, exist_ok=True)
-
-    def add_peak_history(self, state_dict, iteration, reward):
-        path = os.path.join(self.pool_dir, f"peak_iter_{iteration}_rew_{reward:.4f}.pth")
-        torch.save(state_dict, path)
-        self.history_paths.append(path)
-        if len(self.history_paths) > 10:
-            old_path = self.history_paths.pop(0)
-            if os.path.exists(old_path):
-                os.remove(old_path)
-        print(f"     [*] 对手池已更新：成功收录新的巅峰模型快照 (Iteration {iteration})")
-
-    def sample_opponent_paths(self):
-        opponents = []
-        for _ in range(3):
-            r = random.random()
-            if r < 0.60:
-                opponents.append("latest")
-            elif r < 0.90 and len(self.history_paths) > 0:
-                opponents.append(random.choice(self.history_paths))
-            else:
-                opponents.append("base")
-        return opponents
-
-# ==========================================
-# 5. マルチプロセス・ワーカー定義 (Multiprocessing Worker)
-# ==========================================
-
-def async_environment_worker(worker_id, model_queue, trajectory_queue, steps_to_collect, base_policy_path):
-    """
-    4人のエージェント推論を統合したワーカー。厳密なブロック同期でオンポリシーを維持。
+    V2: 非同期重畳パイプライン。GPUを待たずに自律的にサンプリングを継続し、
+    Bounded Queue (maxsize) によって自動的にメモリと生成速度をコントロールする。
     """
     env = MultiAgentMahjongEnvWrapper()
     
-    local_agent = SmartMahjongMultiTaskNet().to('cpu')
-    local_agent.eval()
+    # ワーカー固有の推論モデル (CPU) をJITトレース済みで準備
+    local_agent_base = SmartMahjongMultiTaskNet(input_channels=256, num_blocks=18).to('cpu')
+    local_agent_base.eval()
     
-    opp_models = [SmartMahjongMultiTaskNet().to('cpu') for _ in range(3)]
-    for opp in opp_models:
-        opp.eval()
-        
-    if os.path.exists(base_policy_path):
-        base_state = torch.load(base_policy_path, map_location='cpu', weights_only=False)
-        for opp in opp_models:
-            opp.load_state_dict(base_state)
-    else:
-        base_state = local_agent.state_dict()
+    # 共有メモリから最新の重みを1回コピー
+    sync_params(shared_model, local_agent_base)
+    
+    # CPU推論の高速化のため、torch.jit.traceを使用
+    print(f"[Worker {worker_id}] JITトレースを実行し、C++高速実行グラフを生成中...")
+    wrapper = PolicyInferenceWrapper(local_agent_base)
+    dummy_s2d = torch.zeros(1, 256, 4, 9, dtype=torch.float32)
+    dummy_c = torch.zeros(1, 16, dtype=torch.float32)
+    dummy_seq = torch.zeros(1, 72, dtype=torch.int64)
+    traced_agent = torch.jit.trace(wrapper, (dummy_s2d, dummy_c, dummy_seq))
+    
+    # 敵モデル群 (自己対局のため全て同じ最新モデルを使用)
+    opp_models = [traced_agent for _ in range(3)]
 
     state_dict, mask, current_player = env.reset()
-    
     pending_transition = None
     accumulated_reward = 0.0
     
+    steps_collected = 0
+    sync_counter = 0
+
     while True:
-        msg = model_queue.get() 
-        if msg == "TERMINATE":
-            break
-            
-        cmd, opp_paths = msg
-        if cmd == "SYNC":
-            time.sleep(random.uniform(0.0, 1.0))
-            for _ in range(10): 
-                try:
-                    latest_state_dict = torch.load("sync_current_model.pth", map_location='cpu', weights_only=False)
-                    break
-                except Exception:
-                    time.sleep(0.1)
-            
-            local_agent.load_state_dict(latest_state_dict)
-            
-            for i, path in enumerate(opp_paths):
-                if path == "latest":
-                    opp_models[i].load_state_dict(latest_state_dict)
-                elif path == "base":
-                    opp_models[i].load_state_dict(base_state)
-                else:
-                    opp_models[i].load_state_dict(torch.load(path, map_location='cpu', weights_only=False))
+        # 定期的に共有メモリから最新のパラメータを引っぱる (Lock無しでも大半は安全)
+        if sync_counter % 64 == 0:
+            sync_params(shared_model, local_agent_base)
+            # JITモデル内部のテンソルも同期される
+        sync_counter += 1
 
-        trajectory_chunk = []
-        steps_collected = 0
-        
-        while steps_collected < steps_to_collect:
-            s_2d = torch.tensor(state_dict['state_2d'], dtype=torch.float32).unsqueeze(0)
-            c_vec = torch.tensor(state_dict['cond_vec'], dtype=torch.float32).unsqueeze(0)
-            seq_h = torch.tensor(state_dict['seq_hist'], dtype=torch.int64).unsqueeze(0)
-            t_mask = torch.tensor(mask, dtype=torch.float32).unsqueeze(0)
+        s_2d = torch.tensor(state_dict['state_2d'], dtype=torch.float32).unsqueeze(0)
+        c_vec = torch.tensor(state_dict['cond_vec'], dtype=torch.float32).unsqueeze(0)
+        seq_h = torch.tensor(state_dict['seq_hist'], dtype=torch.int64).unsqueeze(0)
+        t_mask = torch.tensor(mask, dtype=torch.float32).unsqueeze(0)
 
-            with torch.no_grad():
-                if current_player == 0:
-                    p_disc, _, _, v_score, _, _ = local_agent(s_2d, c_vec, seq_h, rl_mode=True)
-                else:
-                    p_disc, _, _, _, _, _ = opp_models[current_player - 1](s_2d, c_vec, seq_h, rl_mode=True)
-                    
-            masked_logits = p_disc + (1.0 - t_mask) * -1e9
-            probs = F.softmax(masked_logits, dim=-1)
-            dist = torch.distributions.Categorical(probs)
-            action = dist.sample()
-            action_val = action.item()
-            
+        with torch.no_grad():
             if current_player == 0:
-                log_prob_val = dist.log_prob(action).item()
-                value_val = v_score.item()
+                p_out, v_score = traced_agent(s_2d, c_vec, seq_h)
+            else:
+                p_out, _ = opp_models[current_player - 1](s_2d, c_vec, seq_h)
                 
-                if pending_transition is not None:
-                    pending_transition['reward'] = accumulated_reward
-                    pending_transition['done'] = False
-                    trajectory_chunk.append(pending_transition)
-                    steps_collected += 1
-                    accumulated_reward = 0.0
-                    
-                    if steps_collected >= steps_to_collect:
-                        break
-                    
-                pending_transition = {
-                    'state_2d': state_dict['state_2d'],
-                    'cond_vec': state_dict['cond_vec'],
-                    'seq_hist': state_dict['seq_hist'],
-                    'action': action_val,
-                    'mask': mask,
-                    'log_prob': log_prob_val,
-                    'value': value_val
-                }
-                
-            next_state_dict, next_mask, step_reward, done, next_player = env.step(action_val)
+        # 【核心修正】: 47次元の p_out に対するマスキングとサンプリング
+        masked_logits = p_out + (1.0 - t_mask) * -1e9
+        probs = F.softmax(masked_logits, dim=-1)
+        dist = torch.distributions.Categorical(probs)
+        action = dist.sample()
+        action_val = action.item()
+        
+        if current_player == 0:
+            log_prob_val = dist.log_prob(action).item()
+            value_val = v_score.item()
             
             if pending_transition is not None:
-                accumulated_reward += float(step_reward)
-            
-            if done:
-                if pending_transition is not None:
-                    pending_transition['reward'] = accumulated_reward
-                    pending_transition['done'] = True
-                    trajectory_chunk.append(pending_transition)
-                    steps_collected += 1
-                
+                pending_transition['reward'] = accumulated_reward
+                pending_transition['done'] = False
+                # Bounded Queue (maxsize) によりGPUが遅延した場合は自動ブロック(反圧制御)
+                trajectory_queue.put(pending_transition)
                 accumulated_reward = 0.0
-                pending_transition = None
-                next_state_dict, next_mask, next_player = env.reset()
                 
-                if steps_collected >= steps_to_collect:
-                    state_dict, mask, current_player = next_state_dict, next_mask, next_player
-                    break
-                    
-            state_dict, mask, current_player = next_state_dict, next_mask, next_player
+            pending_transition = {
+                'state_2d': state_dict['state_2d'],
+                'cond_vec': state_dict['cond_vec'],
+                'seq_hist': state_dict['seq_hist'],
+                'action': action_val,
+                'mask': mask,
+                'log_prob': log_prob_val,
+                'value': value_val
+            }
+            
+        next_state_dict, next_mask, step_reward, done, next_player = env.step(action_val)
+        
+        if pending_transition is not None:
+            accumulated_reward += float(step_reward)
+        
+        if done:
+            if pending_transition is not None:
+                pending_transition['reward'] = accumulated_reward
+                pending_transition['done'] = True
+                trajectory_queue.put(pending_transition)
+            
+            accumulated_reward = 0.0
+            pending_transition = None
+            next_state_dict, next_mask, next_player = env.reset()
                 
-        trajectory_queue.put(trajectory_chunk)
+        state_dict, mask, current_player = next_state_dict, next_mask, next_player
 
 # ==========================================
-# 6. PPO エンジン (PPO KL-Penalty Engine)
+# 5. PPO エンジン (PPO KL-Penalty & KD for Aux)
 # ==========================================
-
 class PPOBuffer:
     def __init__(self):
         self.states_2d, self.cond_vecs, self.seq_hists = [], [], []
@@ -492,8 +592,7 @@ class PPOKLPenaltyTrainer:
         self.buffer = PPOBuffer()
 
     def update_from_buffer(self, mini_batch_size=256):
-        if len(self.buffer.rewards) == 0:
-            return 0.0, 0.0 # 【変更】 報酬がない場合はタプル (0.0, 0.0) を返す
+        if len(self.buffer.rewards) == 0: return 0.0, 0.0 
 
         self.model.train()
         s_2d = torch.tensor(np.array(self.buffer.states_2d), dtype=torch.float32, device=self.device)
@@ -514,7 +613,6 @@ class PPOKLPenaltyTrainer:
         for w in range(num_workers):
             start_idx = w * steps_per_worker
             end_idx = start_idx + steps_per_worker
-            
             w_rewards = rewards[start_idx:end_idx]
             w_values = old_values[start_idx:end_idx]
             w_dones = dones[start_idx:end_idx]
@@ -524,11 +622,7 @@ class PPOKLPenaltyTrainer:
             w_advantages = []
             gae = 0.0
             for t in reversed(range(steps_per_worker)):
-                if t == steps_per_worker - 1:
-                    v_next = next_val
-                else:
-                    v_next = w_values[t + 1]
-                
+                v_next = next_val if t == steps_per_worker - 1 else w_values[t + 1]
                 delta = w_rewards[t] + self.gamma * v_next * (1 - w_dones[t]) - w_values[t]
                 gae = delta + self.gamma * self.gae_lambda * (1 - w_dones[t]) * gae
                 w_advantages.insert(0, gae)
@@ -543,11 +637,11 @@ class PPOKLPenaltyTrainer:
         adv_std = torch.sqrt(torch.mean((advantages - adv_mean) ** 2) + 1e-8)
         advantages = (advantages - adv_mean) / (adv_std + 1e-8)
 
-        classes = torch.arange(34, device=self.device).unsqueeze(0)
+        classes = torch.arange(47, device=self.device).unsqueeze(0)
         one_hot_actions = (actions.unsqueeze(1) == classes).to(torch.float32)
 
         total_ppo_loss = 0.0
-        total_entropy_val = 0.0 # 【追加】 エントロピー（Entropy）の累積値
+        total_entropy_val = 0.0 
         batch_size = len(rewards)
         indices = np.arange(batch_size)
         num_updates = 0
@@ -569,20 +663,34 @@ class PPOKLPenaltyTrainer:
                 mb_returns = returns[mb_indices]
                 mb_old_values = old_values_tensor[mb_indices]
                 
-                p_disc, _, _, v_score, _, _ = self.model(mb_s_2d, mb_c_vec, mb_seq_h)
+                # 【核心修正】: 47次元の p_out を用いたポリシー損失の計算
+                p_out, v_score, aux_t, aux_d, aux_w = self.model(mb_s_2d, mb_c_vec, mb_seq_h, rl_mode=True)
                 new_values = v_score.squeeze(-1)
-                p_disc_masked = p_disc + (1.0 - mb_masks) * -1e9
-                new_probs = F.softmax(p_disc_masked, dim=-1)
+                p_out_masked = p_out + (1.0 - mb_masks) * -1e9
+                new_probs = F.softmax(p_out_masked, dim=-1)
                 
+                # SLベースモデルからの蒸留 (Knowledge Distillation for Aux Heads)
                 with torch.no_grad():
-                    sl_disc, _, _, _, _, _ = self.sl_model(mb_s_2d, mb_c_vec, mb_seq_h)
-                    sl_disc_masked = sl_disc + (1.0 - mb_masks) * -1e9
-                    sl_probs = F.softmax(sl_disc_masked, dim=-1)
+                    sl_disc, _, _, _, sl_t, sl_d, sl_w = self.sl_model(mb_s_2d, mb_c_vec, mb_seq_h, rl_mode=False)
+
+                    # 【修正】: 如果 mb_masks 是 34 维，需要将其扩展/补齐到 47 维以匹配 sl_out (47维)
+                    # 假设 34~46 的动作在采样的 step 中也有 mask，或者我们只对前34维打掩码：
+                    if mb_masks.size(-1) == 34:
+                        full_mask = torch.zeros(mb_masks.size(0), 47, device=self.device)
+                        full_mask[:, :34] = mb_masks
+                        # 对于 34~46 的动作（吃碰杠等），如果环境判定合法，也可以在这里赋值，
+                        # 若暂时无法判定，可默认设为合法(1.0)或交由环境valid_actions控制
+                        full_mask[:, 34:] = 1.0 
+                    else:
+                        full_mask = mb_masks
+
+                    sl_probs = F.softmax(sl_disc + (1.0 - full_mask) * -1e9, dim=-1)
+                    sl_t_target = torch.sigmoid(sl_t)
+                    sl_d_target = torch.sigmoid(sl_d)
+                    sl_w_target = torch.sigmoid(sl_w)
                 
                 log_probs_all = torch.log(new_probs + 1e-8)
                 new_log_probs = (log_probs_all * mb_one_hot_actions).sum(dim=-1)
-                
-                # エントロピー計算
                 entropy = -(new_probs * log_probs_all).sum(dim=-1).mean()
                 
                 log_diff = torch.clamp(new_log_probs - mb_old_log_probs, -5.0, 5.0)
@@ -598,10 +706,15 @@ class PPOKLPenaltyTrainer:
                 vf_loss2 = F.smooth_l1_loss(v_clipped, mb_returns, reduction='none')
                 value_loss = torch.max(vf_loss1, vf_loss2).mean()
                 
-                sl_probs_safe = torch.clamp(sl_probs, min=1e-8)
-                kl_div = (sl_probs * (torch.log(sl_probs_safe) - log_probs_all)).sum(dim=-1).mean()
+                kl_div = (sl_probs * (torch.log(torch.clamp(sl_probs, min=1e-8)) - log_probs_all)).sum(dim=-1).mean()
                 
-                total_loss = policy_loss + 1.0 * value_loss - 0.01 * entropy + self.kl_beta * kl_div
+                # 補助ヘッドのKD損失 (ウェイト λ = 0.05 を適用)
+                loss_aux_t = F.binary_cross_entropy_with_logits(aux_t, sl_t_target)
+                loss_aux_d = F.binary_cross_entropy_with_logits(aux_d, sl_d_target)
+                loss_aux_w = F.binary_cross_entropy_with_logits(aux_w, sl_w_target)
+                aux_loss = 0.05 * (loss_aux_t + loss_aux_d + loss_aux_w)
+                
+                total_loss = policy_loss + 1.0 * value_loss - 0.01 * entropy + self.kl_beta * kl_div + aux_loss
                 
                 self.optimizer.zero_grad()
                 total_loss.backward()
@@ -609,179 +722,135 @@ class PPOKLPenaltyTrainer:
                 self.optimizer.step()
                 
                 total_ppo_loss += total_loss.item()
-                total_entropy_val += entropy.item() # 【追加】 エントロピー累積
+                total_entropy_val += entropy.item() 
                 num_updates += 1
             
         self.buffer.clear()
-        
-        # 【変更】 PPO Loss と Entropy の平均値をタプルとして返す
-        if num_updates > 0:
-            return total_ppo_loss / num_updates, total_entropy_val / num_updates
-        else:
-            return 0.0, 0.0
+        if num_updates > 0: return total_ppo_loss / num_updates, total_entropy_val / num_updates
+        else: return 0.0, 0.0
 
-# ==========================================
-# 【変更】学習曲線の可視化機能 (Training Curve Visualization)
-# エントロピー曲線を追加し、1行3列のレイアウトに変更
-# ==========================================
-def save_rl_training_curve(loss_history, reward_history, entropy_history, chart_path='rl_training_curve.png'):
-    # 画像サイズを横長に拡張して3つのグラフを収容
+def save_rl_training_curve(loss_history, reward_history, entropy_history, chart_path='rl_training_curve_v2.png'):
     plt.figure(figsize=(18, 5))
-    
-    # 1. PPO Loss グラフ
     plt.subplot(1, 3, 1)
     plt.plot(loss_history, label='PPO Loss', color='purple')
-    plt.xlabel('Iteration')
-    plt.ylabel('Loss')
-    plt.title('PPO Training Loss')
-    plt.legend()
-    plt.grid(True)
-    
-    # 2. Avg Reward グラフ
+    plt.legend(); plt.grid(True)
     plt.subplot(1, 3, 2)
-    plt.plot(reward_history, label='Avg Reward', color='darkorange')
-    plt.xlabel('Iteration')
-    plt.ylabel('Reward')
-    plt.title('Multi-Agent Self-Play Reward')
-    plt.legend()
-    plt.grid(True)
-    
-    # 3. Policy Entropy グラフ (方策エントロピー/探索度合い)
+    plt.plot(reward_history, label='Avg Reward (with Rank Bonus)', color='darkorange')
+    plt.legend(); plt.grid(True)
     plt.subplot(1, 3, 3)
     plt.plot(entropy_history, label='Policy Entropy', color='teal')
-    plt.xlabel('Iteration')
-    plt.ylabel('Entropy')
-    plt.title('Policy Entropy (Exploration)')
-    plt.legend()
-    plt.grid(True)
-    
+    plt.legend(); plt.grid(True)
     plt.tight_layout()
     plt.savefig(chart_path, dpi=300)
     plt.close()
 
 # ==========================================
-# 7. メイン実行スクリプト (Main Routine)
+# 6. メイン実行スクリプト (Main Routine V2)
 # ==========================================
-
 if __name__ == '__main__':
     mp.set_start_method('spawn', force=True)
     
-    print("="*50)
-    print("🚀 PPO Multi-Agent Self-Play Pipeline (4-Player) - Phase 1 (Re-Run)") 
-    print("="*50)
+    print("="*60)
+    print("🚀 PPO Multi-Agent Self-Play V2 (Pipeline Overlapped, 256ch)") 
+    print("="*60)
     
     NUM_WORKERS = 10                 
     STEPS_PER_WORKER = 512          
     TOTAL_ITERATIONS = 5000         
     TARGET_BUFFER_SIZE = NUM_WORKERS * STEPS_PER_WORKER 
     
-    if torch_directml.is_available():
-        device = torch_directml.device()
-    else:
-        device = torch.device('cpu')
+    if torch_directml.is_available(): device = torch_directml.device()
+    else: device = torch.device('cpu')
     
-    model = SmartMahjongMultiTaskNet()
-    sl_base_model = SmartMahjongMultiTaskNet()
+    # モデルの初期化 (256ch, 18 blocks)
+    model = SmartMahjongMultiTaskNet(input_channels=256, num_blocks=18).to(device)
+    sl_base_model = SmartMahjongMultiTaskNet(input_channels=256, num_blocks=18).to(device)
     
-    # Phase 1の再実行：常に監督学習（SL）のベースモデルを起点とする
-    base_policy_path = "smart_mahjong_base_policy.pth"
+    base_policy_path = "smart_mahjong_base_policy_v2.pth"
     if os.path.exists(base_policy_path):
         sl_base_model.load_state_dict(torch.load(base_policy_path, map_location='cpu', weights_only=False))
         model.load_state_dict(torch.load(base_policy_path, map_location='cpu', weights_only=False))
-        print(f" -> [Info] SLベースポリシーを読み込みました: {base_policy_path}")
+        print(f" -> [Info] SLベースポリシー V2 を読み込みました: {base_policy_path}")
     
-    # Phase 1 学習率 (1e-4) を使用
-    trainer = PPOKLPenaltyTrainer(model, sl_base_model, device, lr=1e-4, kl_beta=0.05)
-    pool_manager = OpponentPoolManager(base_policy_path)
+    # 共有メモリモデルの初期化 (ディスクI/O廃止)
+    shared_model = SmartMahjongMultiTaskNet(input_channels=256, num_blocks=18).to('cpu')
+    shared_model.load_state_dict(model.state_dict())
+    shared_model.share_memory_() # メモリ共有を有効化
     
-    trajectory_queue = mp.Queue()
-    model_queues = [mp.Queue() for _ in range(NUM_WORKERS)]
+    trainer = PPOKLPenaltyTrainer(model, sl_base_model, device, lr=5e-5, kl_beta=0.05)
     
-    sync_model_path = "sync_current_model.pth"
-    torch.save(model.state_dict(), sync_model_path)
-    initial_opps = pool_manager.sample_opponent_paths()
+    # Bounded Queue (反圧制御: メモリ枯渇を防ぐため最大容量を制限)
+    trajectory_queue = mp.Queue(maxsize=NUM_WORKERS * 4 * STEPS_PER_WORKER)
     
     workers = []
     for i in range(NUM_WORKERS):
-        p = mp.Process(target=async_environment_worker, args=(i, model_queues[i], trajectory_queue, STEPS_PER_WORKER, base_policy_path))
+        p = mp.Process(target=async_environment_worker, args=(i, shared_model, trajectory_queue, STEPS_PER_WORKER))
         p.start()
         workers.append(p)
-        model_queues[i].put(("SYNC", initial_opps)) 
     
     ppo_loss_history = []
     reward_history = []
-    entropy_history = [] # 【追加】 エントロピー追跡用リスト
+    entropy_history = [] 
     best_avg_reward = -float('inf')
 
     try:
         for it in range(1, TOTAL_ITERATIONS + 1):
-            collected_steps = 0
             iteration_reward = 0.0
+            added_steps = 0
             
-            rollout_pbar = tqdm(total=TARGET_BUFFER_SIZE, desc=f"Iter [{it}/{TOTAL_ITERATIONS}] Rollout", leave=False)
-            while collected_steps < TARGET_BUFFER_SIZE:
-                chunk = trajectory_queue.get()
-                added_steps = 0
-                for step_data in chunk:
-                    if len(trainer.buffer.rewards) >= TARGET_BUFFER_SIZE:
-                        break 
-                        
-                    trainer.buffer.states_2d.append(step_data['state_2d'])
-                    trainer.buffer.cond_vecs.append(step_data['cond_vec'])
-                    trainer.buffer.seq_hists.append(step_data['seq_hist'])
-                    trainer.buffer.actions.append(step_data['action'])
-                    trainer.buffer.masks.append(step_data['mask'])
-                    trainer.buffer.log_probs.append(step_data['log_prob'])
-                    trainer.buffer.rewards.append(step_data['reward'])
-                    trainer.buffer.state_values.append(step_data['value'])
-                    trainer.buffer.dones.append(step_data['done'])
-                    iteration_reward += step_data['reward']
-                    added_steps += 1
-                    
-                collected_steps += added_steps
-                rollout_pbar.update(added_steps)
+            # 非同期キューからデータを吸い上げる (ワーカーはブロックされず並列採集を続ける)
+            rollout_pbar = tqdm(total=TARGET_BUFFER_SIZE, desc=f"Iter [{it}/{TOTAL_ITERATIONS}] Async Rollout", leave=False)
+            while added_steps < TARGET_BUFFER_SIZE:
+                step_data = trajectory_queue.get() # データが来るまで待機
+                
+                trainer.buffer.states_2d.append(step_data['state_2d'])
+                trainer.buffer.cond_vecs.append(step_data['cond_vec'])
+                trainer.buffer.seq_hists.append(step_data['seq_hist'])
+                trainer.buffer.actions.append(step_data['action'])
+                trainer.buffer.masks.append(step_data['mask'])
+                trainer.buffer.log_probs.append(step_data['log_prob'])
+                trainer.buffer.rewards.append(step_data['reward'])
+                trainer.buffer.state_values.append(step_data['value'])
+                trainer.buffer.dones.append(step_data['done'])
+                
+                iteration_reward += step_data['reward']
+                added_steps += 1
+                rollout_pbar.update(1)
             rollout_pbar.close()
             
+            # PPO 更新 (GPUプロセス)
             update_pbar = tqdm(total=trainer.ppo_epochs, desc=f"Iter [{it}/{TOTAL_ITERATIONS}] Optim  ", leave=False)
-            
-            # 【変更】 PPO LossとEntropyの2つの戻り値を受け取る
-            ppo_loss, avg_entropy = trainer.update_from_buffer(mini_batch_size=512) 
-            
+            ppo_loss, avg_entropy = trainer.update_from_buffer(mini_batch_size=256) 
             update_pbar.update(trainer.ppo_epochs)
             update_pbar.close()
+
+            # パラメータを共有メモリモデルに同期 (CPU Workersが次ステップから自動参照)
+            sync_params(trainer.model.to('cpu'), shared_model)
+            trainer.model.to(device)
+
+            gc.collect()
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
             
             avg_reward = iteration_reward / TARGET_BUFFER_SIZE
             ppo_loss_history.append(ppo_loss)
             reward_history.append(avg_reward)
-            entropy_history.append(avg_entropy) # 【追加】 履歴リストに記録
+            entropy_history.append(avg_entropy) 
 
             if avg_reward > best_avg_reward:
                 best_avg_reward = avg_reward
-                best_path = "smart_mahjong_ppo_best.pth"
+                best_path = "smart_mahjong_ppo_best_v2.pth"
                 torch.save(trainer.model.state_dict(), best_path)
-                print(f"     [*] 新的最高奖励！已更新最优模型存档 -> {best_path} (Reward: {avg_reward:.4f})")
-                pool_manager.add_peak_history(trainer.model.state_dict(), it, avg_reward)
+                print(f"     [*] 新的最高奖励！(包含顺位分) -> {best_path} (Reward: {avg_reward:.4f})")
 
-            torch.save(trainer.model.state_dict(), sync_model_path)
-            new_opps = pool_manager.sample_opponent_paths()
-                
-            for q in model_queues:
-                q.put(("SYNC", new_opps))
-            
-            # 【変更】 ターミナル出力に Entropy を追加
             print(f"✅ Iter [{it:04d}/{TOTAL_ITERATIONS}] | PPO Loss: {ppo_loss:.4f} | Avg Step Reward: {avg_reward:.4f} | Entropy: {avg_entropy:.4f}")
 
     except KeyboardInterrupt:
         print("\n[Warn] 訓練がユーザーによって中断されました。(Training interrupted by user.)")
     finally:
         print("-> [Info] ワーカープロセスを終了しています...")
-        for q in model_queues:
-            q.put("TERMINATE")
         for p in workers:
+            p.terminate()
             p.join(timeout=2.0)
-            if p.is_alive():
-                p.terminate()
                 
-        # 【変更】 グラフ出力関数に entropy_history を引数として渡す
-        save_rl_training_curve(ppo_loss_history, reward_history, entropy_history, chart_path='rl_training_curve.png')
-        print("🎉 自己対局パイプラインの実行が完了しました。(Pipeline finished.)")
+        save_rl_training_curve(ppo_loss_history, reward_history, entropy_history, chart_path='rl_training_curve_v2.png')
+        print("🎉 V2 非同期自己対局パイプラインの実行が完了しました。(Pipeline finished.)")

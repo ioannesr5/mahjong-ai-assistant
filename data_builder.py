@@ -6,7 +6,11 @@ import numpy as np
 import traceback
 import gzip
 from tqdm import tqdm
-from feature_extractor import MahjongFeatureExtractor128, MahjongGameState, PlayerState, parse_tile
+
+# 注意: 向聴数（Shanten）と待ち牌（Waits）を正確に計算するため、
+# 標準の mahjong ライブラリを使用します。(pip install mahjong)
+from mahjong.shanten import Shanten
+from feature_extractor import MahjongFeatureExtractor256, MahjongGameState, PlayerState, parse_tile
 
 # ==========================================
 # 1. アクションID定義 (Action ID Definitions)
@@ -32,24 +36,62 @@ def create_initial_game_state() -> MahjongGameState:
         global_discards=[]
     )
 
+def calculate_waits_matrix(act_seat: int, current_hands: dict, shanten_calculator: Shanten) -> np.ndarray:
+    """
+    他家3人の手牌からテンパイ状態（聴牌状態）を判定し、
+    102次元（3家 × 34牌）の待ち牌マトリックス（待牌マトリックス）を生成する。
+    （计算除行动者外其余三家的听牌待牌矩阵）
+    """
+    waits_matrix = np.zeros(102, dtype=np.float32)
+    
+    for rel_p in range(1, 4):
+        target_id = (act_seat + rel_p) % 4
+        target_hand = current_hands[target_id]
+        
+        # 34次元の牌カウント配列に変換 (转换为34维计数组)
+        tiles_34 = [0] * 34
+        for tile_str in target_hand:
+            if tile_str != "?":  # 未知の牌は無視
+                t_id, _ = parse_tile(tile_str)
+                tiles_34[t_id] += 1
+                
+        # 手牌が13枚（またはそれ以下で副露済み）の場合、向聴数を計算
+        if sum(tiles_34) % 3 == 1:
+            shanten = shanten_calculator.calculate_shanten(tiles_34)
+            # 向聴数 == 0 ならテンパイ（聴牌）
+            if shanten == 0:
+                # 34種の牌を順番に加えて和了（アガリ / Shanten == -1）になるかテスト
+                for i in range(34):
+                    if tiles_34[i] < 4:
+                        tiles_34[i] += 1
+                        if shanten_calculator.calculate_shanten(tiles_34) == -1:
+                            # 和了できる牌なら待ち牌として 1.0 を立てる
+                            waits_matrix[(rel_p - 1) * 34 + i] = 1.0
+                        tiles_34[i] -= 1
+                        
+    return waits_matrix
+
 class MjaiLogParser:
     """
     MJAI形式のログを解析し、マルチタスク学習用の特徴量とラベルを抽出する。
-    （解析 MJAI 格式日志，提取多任务学习用的特征与标签）
+    V2: 256チャネル対応および aux_waits のラベル抽出を追加。
     """
-    def __init__(self, extractor: MahjongFeatureExtractor128):
+    def __init__(self, extractor: MahjongFeatureExtractor256):
         self.extractor = extractor
+        self.shanten_calculator = Shanten() # 向聴数計算機を初期化
 
     def parse_file(self, file_path: str):
         main_buffer = {
             'state_2d': [], 'cond_vec': [], 'seq_hist': [],
             't_disc': [], 't_act': [], 'm_disc': [], 'm_act': [],
-            't_score': [], 't_tenpai': [], 't_danger': []
+            't_score': [], 't_tenpai': [], 't_danger': [],
+            't_waits': [] # V2: 敵方待牌分布ラベル (Enemy waits distribution) [102次元]
         }
 
         kyoku_buffer = {
             'actor': [], 'state_2d': [], 'cond_vec': [], 'seq_hist': [],
-            't_disc': [], 't_act': [], 'm_disc': [], 'm_act': []
+            't_disc': [], 't_act': [], 'm_disc': [], 'm_act': [],
+            'current_hands_snapshot': [] # 毎ステップの他家手牌状態を保存し、後で待ち牌を計算
         }
 
         game_state = create_initial_game_state()
@@ -92,8 +134,14 @@ class MjaiLogParser:
                 delta_score = score_changes[act] / 10000.0 if act < len(score_changes) else 0.0
                 main_buffer['t_score'].append(delta_score)
                 
+                # プレースホルダーとしてゼロ初期化（後続タスクで拡充可能）
                 main_buffer['t_tenpai'].append(np.zeros(3, dtype=np.float32))
                 main_buffer['t_danger'].append(np.zeros(102, dtype=np.float32))
+                
+                # V2: 毎ステップ記録した手牌スナップショットから待牌マトリックスを計算
+                hands_snapshot = kyoku_buffer['current_hands_snapshot'][i]
+                waits_matrix = calculate_waits_matrix(act, hands_snapshot, self.shanten_calculator)
+                main_buffer['t_waits'].append(waits_matrix)
                 
             for key in kyoku_buffer:
                 kyoku_buffer[key].clear()
@@ -133,28 +181,19 @@ class MjaiLogParser:
                         game_state.self_seat = actor
                         game_state.closed_hand = list(player_hands[actor])
                         
-                        # 1. 提取基础特征
                         feats = self.extractor.extract(game_state)
                         tile_id, _ = parse_tile(tile)
 
-                        # 2. 【核心修改】将原本的 seq_hist 转换为 0~272 的联合编码复合 Token
-                        # 公式: token = tile_id * 8 + relative_player_id * 2 + cut_type
+                        # V2: seq_hist を 0~272 の複合 Token に変換
                         raw_seq = feats.get("seq_hist", np.full(72, 34, dtype=np.int64))
-                        
-                        # 计算当前行动者相对于主视角（self_seat）的相对位置 (0~3)
-                        relative_player_id = (actor - actor) & 3 # 在当前 actor 决策视角下，自己看自己通常为 0
-                        # 注意：若特征提取器内部已经统一了视角转换，此处可直接适配。
-                        # 为保证与公式严格契合，我们引入基于当前行动者视角的计算：
-                        # cut_type: 0 = 摸切 (tsumogiri), 1 = 手切 (te giri)
+                        relative_player_id = (actor - actor) & 3 
                         cut_type = 0 if is_tsumogiri else 1
 
                         encoded_seq = []
                         for t in raw_seq:
-                            if t >= 34:  # 假设 34 或以上代表 Padding
-                                encoded_seq.append(272) # 272 作为填充符 (Padding Token)
+                            if t >= 34: 
+                                encoded_seq.append(272) 
                             else:
-                                # 赋予默认的相对玩家 ID (如果 FeatureExtractor 未输出多玩家标记，默认归为对家或统一计算)
-                                # 此处采用健壮的映射：t * 8 + 0 * 2 + cut_type
                                 token = int(t) * 8 + 0 * 2 + cut_type
                                 encoded_seq.append(min(token, 272))
 
@@ -163,11 +202,15 @@ class MjaiLogParser:
                         kyoku_buffer['actor'].append(actor)
                         kyoku_buffer['state_2d'].append(feats["state_2d"])
                         kyoku_buffer['cond_vec'].append(feats["cond_vec"])
-                        kyoku_buffer['seq_hist'].append(encoded_seq) # 存入重构后的 0~272 复合序列
+                        kyoku_buffer['seq_hist'].append(encoded_seq) 
                         kyoku_buffer['t_disc'].append(tile_id)
                         kyoku_buffer['t_act'].append(ACTION_PASS)
                         kyoku_buffer['m_disc'].append(1.0)
                         kyoku_buffer['m_act'].append(0.0)
+                        
+                        # 手牌スナップショットをディープコピーして保存 (ディープコピーによる状態の保存)
+                        snapshot = {k: list(v) for k, v in player_hands.items()}
+                        kyoku_buffer['current_hands_snapshot'].append(snapshot)
 
                     if tile in player_hands[actor]:
                         player_hands[actor].remove(tile)
@@ -185,9 +228,7 @@ class MjaiLogParser:
                         
                         feats = self.extractor.extract(game_state)
                         raw_seq = feats.get("seq_hist", np.full(72, 34, dtype=np.int64))
-                        
-                        # 动作事件的 seq_hist 同样做复合编码对齐
-                        encoded_seq = np.where(raw_seq >= 34, 272, raw_seq * 8) # 默认补零对齐
+                        encoded_seq = np.where(raw_seq >= 34, 272, raw_seq * 8) 
                         
                         act_id = ACTION_CHI if type_str == "chi" else (ACTION_PON if type_str == "pon" else ACTION_KAN)
 
@@ -199,6 +240,9 @@ class MjaiLogParser:
                         kyoku_buffer['t_act'].append(act_id)
                         kyoku_buffer['m_disc'].append(0.0)
                         kyoku_buffer['m_act'].append(1.0)
+                        
+                        snapshot = {k: list(v) for k, v in player_hands.items()}
+                        kyoku_buffer['current_hands_snapshot'].append(snapshot)
 
                     for c_tile in consumed:
                         if c_tile in player_hands[actor]:
@@ -231,14 +275,15 @@ class MjaiLogParser:
         return (
             np.array(main_buffer['state_2d'], dtype=np.float32),
             np.array(main_buffer['cond_vec'], dtype=np.float32),
-            np.array(main_buffer['seq_hist'], dtype=np.int64), # 此处输出的 dtype 将被正确写入 HDF5
+            np.array(main_buffer['seq_hist'], dtype=np.int64), 
             np.array(main_buffer['t_disc'], dtype=np.int64),
             np.array(main_buffer['t_act'], dtype=np.int64),
             np.array(main_buffer['m_disc'], dtype=np.float32),
             np.array(main_buffer['m_act'], dtype=np.float32),
             np.array(main_buffer['t_score'], dtype=np.float32),
             np.array(main_buffer['t_tenpai'], dtype=np.float32),
-            np.array(main_buffer['t_danger'], dtype=np.float32)
+            np.array(main_buffer['t_danger'], dtype=np.float32),
+            np.array(main_buffer['t_waits'], dtype=np.float32) # V2 追加
         )
 
 # ==========================================
@@ -260,13 +305,14 @@ def build_dataset(log_dir: str, output_dir: str, max_files: int = 5000):
     train_files = selected_files[:split_idx]
     val_files = selected_files[split_idx:]
 
-    extractor = MahjongFeatureExtractor128()
+    extractor = MahjongFeatureExtractor256() # V2: 256チャネルExtractorを使用
     parser = MjaiLogParser(extractor)
 
     def process_and_save(file_list, h5_path):
         print(f"\n--- HDF5 作成開始: {h5_path} ---")
         with h5py.File(h5_path, 'w') as h5f:
-            ds_state = h5f.create_dataset('state_2d', shape=(0, 128, 4, 9), maxshape=(None, 128, 4, 9), dtype='float32', chunks=(128, 128, 4, 9))
+            # V2: state_2d のチャネル数を 128 から 256 に変更
+            ds_state = h5f.create_dataset('state_2d', shape=(0, 256, 4, 9), maxshape=(None, 256, 4, 9), dtype='float32', chunks=(128, 256, 4, 9))
             ds_cond = h5f.create_dataset('cond_vec', shape=(0, 16), maxshape=(None, 16), dtype='float32')
             ds_seq = h5f.create_dataset('seq_hist', shape=(0, 72), maxshape=(None, 72), dtype='int64')
             
@@ -278,6 +324,9 @@ def build_dataset(log_dir: str, output_dir: str, max_files: int = 5000):
             ds_t_score = h5f.create_dataset('target_score', shape=(0,), maxshape=(None,), dtype='float32')
             ds_t_tenpai = h5f.create_dataset('target_tenpai', shape=(0, 3), maxshape=(None, 3), dtype='float32')
             ds_t_danger = h5f.create_dataset('target_danger', shape=(0, 102), maxshape=(None, 102), dtype='float32')
+            
+            # V2: aux_waits 用のデータセットを追加
+            ds_t_waits = h5f.create_dataset('target_waits', shape=(0, 102), maxshape=(None, 102), dtype='float32')
 
             total_samples = 0
             for fpath in tqdm(file_list, desc="Processing Logs"):
@@ -285,15 +334,15 @@ def build_dataset(log_dir: str, output_dir: str, max_files: int = 5000):
                 if res is None:
                     continue
 
-                state, cond, seq, t_disc, t_act, m_disc, m_act, t_score, t_tenpai, t_danger = res
+                state, cond, seq, t_disc, t_act, m_disc, m_act, t_score, t_tenpai, t_danger, t_waits = res
                 n_samples = state.shape[0]
 
-                for ds in [ds_state, ds_cond, ds_seq, ds_t_disc, ds_t_act, ds_m_disc, ds_m_act, ds_t_score, ds_t_tenpai, ds_t_danger]:
+                for ds in [ds_state, ds_cond, ds_seq, ds_t_disc, ds_t_act, ds_m_disc, ds_m_act, ds_t_score, ds_t_tenpai, ds_t_danger, ds_t_waits]:
                     ds.resize(total_samples + n_samples, axis=0)
 
                 ds_state[total_samples:total_samples + n_samples] = state
                 ds_cond[total_samples:total_samples + n_samples] = cond
-                ds_seq[total_samples:total_samples + n_samples] = seq # 写入 0~272 编码序列
+                ds_seq[total_samples:total_samples + n_samples] = seq 
                 ds_t_disc[total_samples:total_samples + n_samples] = t_disc
                 ds_t_act[total_samples:total_samples + n_samples] = t_act
                 ds_m_disc[total_samples:total_samples + n_samples] = m_disc
@@ -301,6 +350,7 @@ def build_dataset(log_dir: str, output_dir: str, max_files: int = 5000):
                 ds_t_score[total_samples:total_samples + n_samples] = t_score
                 ds_t_tenpai[total_samples:total_samples + n_samples] = t_tenpai
                 ds_t_danger[total_samples:total_samples + n_samples] = t_danger
+                ds_t_waits[total_samples:total_samples + n_samples] = t_waits # V2: 追加
 
                 total_samples += n_samples
 
