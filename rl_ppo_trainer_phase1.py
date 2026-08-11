@@ -229,6 +229,7 @@ def decode_obs_93_to_256(obs_93: np.ndarray, self_scores: np.ndarray, p_id: int)
     pymahjong のネイティブな 93x34 観測行列を直接解読し、
     V2 の 256x34 テンソルへゼロオーバーヘッドで変換する。
     """
+    obs_93 = obs_93.astype(np.float32)
     state = np.zeros((256, 34), dtype=np.float32)
     
     # ==========================================
@@ -332,8 +333,13 @@ def decode_obs_93_to_256(obs_93: np.ndarray, self_scores: np.ndarray, p_id: int)
     # 211~255: 局勢コンテキスト (Global Context)
     # ==========================================
     # 78: Table wind, 79: Self wind 
-    rw = np.argmax(obs_93[78]) if np.any(obs_93[78]) else 0 #[cite: 17]
-    sw = np.argmax(obs_93[79]) if np.any(obs_93[79]) else 0 #[cite: 17]
+    rw_idx = np.argmax(obs_93[78]) if np.any(obs_93[78]) else 27
+    sw_idx = np.argmax(obs_93[79]) if np.any(obs_93[79]) else 27
+    
+    # 27を引いて 0~3 にマッピングする
+    rw = rw_idx - 27
+    sw = sw_idx - 27
+
     state[211, :] = rw / 3.0
     state[212, :] = sw / 3.0
     
@@ -427,8 +433,12 @@ class MultiAgentMahjongEnvWrapper:
 
         # 3. 条件ベクトル (16次元) の構築
         cond_vec = np.zeros(16, dtype=np.float32)
-        rw = np.argmax(obs_93[78]) if np.any(obs_93[78]) else 0 #[cite: 17]
-        sw = np.argmax(obs_93[79]) if np.any(obs_93[79]) else 0 #[cite: 17]
+        rw_idx = np.argmax(obs_93[78]) if np.any(obs_93[78]) else 27
+        sw_idx = np.argmax(obs_93[79]) if np.any(obs_93[79]) else 27
+        
+        # 27を引いて 0~3 にマッピングする
+        rw = rw_idx - 27
+        sw = sw_idx - 27
         cond_vec[4 + rw] = 1.0
         cond_vec[8 + sw] = 1.0
         for i in range(4):
@@ -566,6 +576,13 @@ def async_environment_worker(worker_id, shared_model, trajectory_queue, steps_to
 # ==========================================
 # 5. PPO エンジン (PPO KL-Penalty & KD for Aux)
 # ==========================================
+
+def directml_safe_bce_with_logits(logits, targets):
+    """ DirectMLのCPUフォールバックを回避するための手動BCE実装 """
+    probs = torch.sigmoid(logits)
+    probs = torch.clamp(probs, 1e-7, 1.0 - 1e-7)
+    return -(targets * torch.log(probs) + (1.0 - targets) * torch.log(1.0 - probs)).mean()
+
 class PPOBuffer:
     def __init__(self):
         self.states_2d, self.cond_vecs, self.seq_hists = [], [], []
@@ -671,20 +688,19 @@ class PPOKLPenaltyTrainer:
                 
                 # SLベースモデルからの蒸留 (Knowledge Distillation for Aux Heads)
                 with torch.no_grad():
-                    sl_disc, _, _, _, sl_t, sl_d, sl_w = self.sl_model(mb_s_2d, mb_c_vec, mb_seq_h, rl_mode=False)
-
-                    # 【修正】: 如果 mb_masks 是 34 维，需要将其扩展/补齐到 47 维以匹配 sl_out (47维)
-                    # 假设 34~46 的动作在采样的 step 中也有 mask，或者我们只对前34维打掩码：
+                    # ✅ 修正 1：完美解包 5 个变量 (p_out, v_head, aux_t, aux_d, aux_w)
+                    sl_out, _, sl_t, sl_d, sl_w = self.sl_model(mb_s_2d, mb_c_vec, mb_seq_h, rl_mode=False)
+                    
                     if mb_masks.size(-1) == 34:
                         full_mask = torch.zeros(mb_masks.size(0), 47, device=self.device)
                         full_mask[:, :34] = mb_masks
-                        # 对于 34~46 的动作（吃碰杠等），如果环境判定合法，也可以在这里赋值，
-                        # 若暂时无法判定，可默认设为合法(1.0)或交由环境valid_actions控制
                         full_mask[:, 34:] = 1.0 
                     else:
                         full_mask = mb_masks
 
-                    sl_probs = F.softmax(sl_disc + (1.0 - full_mask) * -1e9, dim=-1)
+                    # ✅ 修正 2：使用统一的 sl_out 计算 Softmax
+                    sl_probs = F.softmax(sl_out + (1.0 - full_mask) * -1e9, dim=-1)
+                    
                     sl_t_target = torch.sigmoid(sl_t)
                     sl_d_target = torch.sigmoid(sl_d)
                     sl_w_target = torch.sigmoid(sl_w)
@@ -709,9 +725,9 @@ class PPOKLPenaltyTrainer:
                 kl_div = (sl_probs * (torch.log(torch.clamp(sl_probs, min=1e-8)) - log_probs_all)).sum(dim=-1).mean()
                 
                 # 補助ヘッドのKD損失 (ウェイト λ = 0.05 を適用)
-                loss_aux_t = F.binary_cross_entropy_with_logits(aux_t, sl_t_target)
-                loss_aux_d = F.binary_cross_entropy_with_logits(aux_d, sl_d_target)
-                loss_aux_w = F.binary_cross_entropy_with_logits(aux_w, sl_w_target)
+                loss_aux_t = directml_safe_bce_with_logits(aux_t, sl_t_target)
+                loss_aux_d = directml_safe_bce_with_logits(aux_d, sl_d_target)
+                loss_aux_w = directml_safe_bce_with_logits(aux_w, sl_w_target)
                 aux_loss = 0.05 * (loss_aux_t + loss_aux_d + loss_aux_w)
                 
                 total_loss = policy_loss + 1.0 * value_loss - 0.01 * entropy + self.kl_beta * kl_div + aux_loss
@@ -755,7 +771,7 @@ if __name__ == '__main__':
     print("="*60)
     
     NUM_WORKERS = 10                 
-    STEPS_PER_WORKER = 512          
+    STEPS_PER_WORKER = 256          
     TOTAL_ITERATIONS = 5000         
     TARGET_BUFFER_SIZE = NUM_WORKERS * STEPS_PER_WORKER 
     
@@ -775,7 +791,7 @@ if __name__ == '__main__':
     # 共有メモリモデルの初期化 (ディスクI/O廃止)
     shared_model = SmartMahjongMultiTaskNet(input_channels=256, num_blocks=18).to('cpu')
     shared_model.load_state_dict(model.state_dict())
-    shared_model.share_memory_() # メモリ共有を有効化
+    shared_model.share_memory() # メモリ共有を有効化
     
     trainer = PPOKLPenaltyTrainer(model, sl_base_model, device, lr=5e-5, kl_beta=0.05)
     
@@ -842,8 +858,12 @@ if __name__ == '__main__':
                 torch.save(trainer.model.state_dict(), best_path)
                 print(f"     [*] 新的最高奖励！(包含顺位分) -> {best_path} (Reward: {avg_reward:.4f})")
 
-            print(f"✅ Iter [{it:04d}/{TOTAL_ITERATIONS}] | PPO Loss: {ppo_loss:.4f} | Avg Step Reward: {avg_reward:.4f} | Entropy: {avg_entropy:.4f}")
+            if it % 1000 == 0:  
+                current_path = "smart_mahjong_ppo_current_v2.pth" 
+                torch.save(trainer.model.state_dict(), current_path)
+                print(f"     [Save] 当前最新检查点已保存 (最新チェックポイントを保存しました) -> {current_path}")
 
+            print(f"✅ Iter [{it:04d}/{TOTAL_ITERATIONS}] | PPO Loss: {ppo_loss:.4f} | Avg Step Reward: {avg_reward:.4f} | Entropy: {avg_entropy:.4f}")
     except KeyboardInterrupt:
         print("\n[Warn] 訓練がユーザーによって中断されました。(Training interrupted by user.)")
     finally:
@@ -851,6 +871,10 @@ if __name__ == '__main__':
         for p in workers:
             p.terminate()
             p.join(timeout=2.0)
-                
+
+        final_path = "smart_mahjong_ppo_final_v2.pth" 
+        torch.save(trainer.model.state_dict(), final_path)
+        print(f" -> [Save] 5000轮全量训练结束，强制保存最终模型: {final_path}")    
+
         save_rl_training_curve(ppo_loss_history, reward_history, entropy_history, chart_path='rl_training_curve_v2.png')
         print("🎉 V2 非同期自己対局パイプラインの実行が完了しました。(Pipeline finished.)")
