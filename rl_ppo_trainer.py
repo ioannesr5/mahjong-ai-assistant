@@ -2,6 +2,7 @@ import gc
 import glob
 import math
 import os
+import re
 
 import numpy as np
 import pymahjong  # type: ignore
@@ -1139,6 +1140,12 @@ if __name__ == "__main__":
     best_eval_rank = float("inf")
     best_eval_net = -float("inf")
     it = 0
+    if resume_path:
+        # 匹配如 "_iter350.pth" 中的数字
+        match = re.search(r'_iter(\d+)\.pth', resume_path)
+        if match:
+            it = int(match.group(1))
+            print(f" -> [Info] 恢复迭代计数 (イテレーション復元): 从第 {it} 轮开始续训")
 
     try:
         while True:
