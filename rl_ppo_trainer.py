@@ -432,14 +432,19 @@ class MultiAgentMahjongEnvWrapper:
         p = self.current_player
         obs_93 = self.env.get_obs(p)
         
-        # 【修正】シャンテン計算を_get_state_dict内に移動。チート防止メカニズムを回避するため、現在の行動プレイヤーのターンでのみ計算する。
+        # 【修正】シャンテン計算。チート防止メカニズムを回避するため、現在の行動プレイヤーのターンでのみ計算する。
         if p == 0:
             # 特徴行列の0から3のインデックスを合算し、34種の牌の枚数を復元する
             tiles34 = (obs_93[0] + obs_93[1] + obs_93[2] + obs_93[3]).astype(np.int32)
-            current_shanten = self.shanten_calc.calculate_shanten(tiles34)
-            if current_shanten < self.p0_min_shanten:
-                self._pending_shanten_reduction += (self.p0_min_shanten - current_shanten)
-                self.p0_min_shanten = current_shanten
+            try:
+                current_shanten = self.shanten_calc.calculate_shanten(tiles34)
+                if current_shanten < self.p0_min_shanten:
+                    self._pending_shanten_reduction += (self.p0_min_shanten - current_shanten)
+                    self.p0_min_shanten = current_shanten
+            except ValueError:
+                # 【追加】C++ コアが一時的な中間状態（牌数が12など、ルール上あり得ない枚数）
+                # を返した場合は、安全にスキップしてクラッシュを防ぐ (Skip invalid transient states)
+                pass
 
         state_2d = decode_obs_93_to_256(obs_93, self.scores, p)
 
