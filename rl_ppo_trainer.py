@@ -333,6 +333,9 @@ def decode_obs_93_to_256(obs_93: np.ndarray, self_scores: np.ndarray, p_id: int)
     return padded.reshape(256, 4, 9)
 
 class MultiAgentMahjongEnvWrapper:
+    """
+    【リファクタリングのコア】 半荘累計制環境ラッパー (Hanchan Cumulative Wrapper)
+    """
     def __init__(self):
         self.env = pymahjong.MahjongEnv()
         self.shanten_calc = Shanten() # シャンテン計算器を初期化
@@ -342,14 +345,17 @@ class MultiAgentMahjongEnvWrapper:
         return self.reset_hanchan()
         
     def _reset_hand_internal(self):
+        """ 局単位の状態のみをリセットする """
         self.env.reset()
         self.current_player = self.env.get_curr_player_id()
         self.action_history = [] 
         # メトリクス抽出用の変数を初期化
         self.last_discarder = -1
         self.p0_min_shanten = 8 # 初期シャンテンの最大値
+        self._pending_shanten_reduction = 0 # 【追加】未精算のシャンテン進速
 
     def reset_hanchan(self):
+        """ 半荘全体をリセットし、スコアを初期化する """
         self.scores = np.array([25000, 25000, 25000, 25000], dtype=np.float32)
         self.kyoku_count = 0
         self.is_hanchan_done = False
@@ -368,6 +374,12 @@ class MultiAgentMahjongEnvWrapper:
             'shanten_reduction': 0
         }
         
+        # 【修正】アクション実行前に未精算のシャンテン進速をinfoに格納し、直ちにクリアする
+        if p == 0:
+            info['shanten_reduction'] = self._pending_shanten_reduction
+            self._pending_shanten_reduction = 0
+            
+        # 異常打ち切り保護
         if action_id not in valid_actions:
             if p == 0: reward -= 1.0
             return self._get_state_dict(), self._get_mask(), reward, True, p, info
@@ -386,24 +398,17 @@ class MultiAgentMahjongEnvWrapper:
         self.env.step(p, action_id)
         hand_done = self.env.is_over()
         info['hand_done'] = hand_done
-        
-        # シャンテン計算と報酬シェーピングの基盤データ取得
-        if not hand_done and p == 0:
-            obs_93 = self.env.get_obs(0)
-            # 手牌の34種配列を再構築 (特徴インデックス0から3の合計)
-            tiles34 = (obs_93[0] + obs_93[1] + obs_93[2] + obs_93[3]).astype(np.int32)
-            current_shanten = self.shanten_calc.calculate_shanten(tiles34)
-            if current_shanten < self.p0_min_shanten:
-                info['shanten_reduction'] = self.p0_min_shanten - current_shanten
-                self.p0_min_shanten = current_shanten
 
         if hand_done:
             payoffs = self.env.get_payoffs()
             for i in range(4): self.scores[i] += float(payoffs[i])
             self.kyoku_count += 1
             
+            # 【コアロジック】真の半荘終了を判定: 8局打ち終えたか、または点数が0未満のプレイヤー（ハコ割れ/飛び）がいる場合
             if self.kyoku_count >= 8 or np.any(self.scores < 0):
                 self.is_hanchan_done = True
+                
+                # 半荘終了時にのみ、PT素点と順位ボーナスを精算する
                 my_score = self.scores[0]
                 base_reward = (my_score - 25000) / 10000.0
                 rank = sum(1 for x in self.scores if x > my_score)
@@ -413,6 +418,7 @@ class MultiAgentMahjongEnvWrapper:
                 reward = base_reward + bonus
                 self.current_player = p
             else:
+                # 局は終了したが半荘は未終了の場合、報酬の精算は行わず、そのまま自動的に次局へ進む
                 self._reset_hand_internal()
         else:
             self.current_player = self.env.get_curr_player_id()
@@ -425,6 +431,16 @@ class MultiAgentMahjongEnvWrapper:
 
         p = self.current_player
         obs_93 = self.env.get_obs(p)
+        
+        # 【修正】シャンテン計算を_get_state_dict内に移動。チート防止メカニズムを回避するため、現在の行動プレイヤーのターンでのみ計算する。
+        if p == 0:
+            # 特徴行列の0から3のインデックスを合算し、34種の牌の枚数を復元する
+            tiles34 = (obs_93[0] + obs_93[1] + obs_93[2] + obs_93[3]).astype(np.int32)
+            current_shanten = self.shanten_calc.calculate_shanten(tiles34)
+            if current_shanten < self.p0_min_shanten:
+                self._pending_shanten_reduction += (self.p0_min_shanten - current_shanten)
+                self.p0_min_shanten = current_shanten
+
         state_2d = decode_obs_93_to_256(obs_93, self.scores, p)
 
         cond_vec = np.zeros(16, dtype=np.float32)
