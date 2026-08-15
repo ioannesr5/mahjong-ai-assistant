@@ -1,6 +1,7 @@
 import os
-import requests
 import zipfile
+
+import requests
 from tqdm import tqdm
 
 # ==========================================
@@ -14,6 +15,7 @@ LOGS_DIR = os.path.join(DATA_DIR, "logs")
 # ダウンロード先のディレクトリを作成（创建下载目标文件夹）
 os.makedirs(MODELS_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
+
 
 def download_file(url, dest_path, desc="Downloading"):
     """
@@ -33,16 +35,19 @@ def download_file(url, dest_path, desc="Downloading"):
         }
         response = requests.get(url, headers=headers, stream=True, timeout=30)
         response.raise_for_status()
-        
-        total_size = int(response.headers.get('content-length', 0))
-        
-        with open(dest_path, 'wb') as file, tqdm(
-            desc=desc,
-            total=total_size,
-            unit='iB',
-            unit_scale=True,
-            unit_divisor=1024,
-        ) as bar:
+
+        total_size = int(response.headers.get("content-length", 0))
+
+        with (
+            open(dest_path, "wb") as file,
+            tqdm(
+                desc=desc,
+                total=total_size,
+                unit="iB",
+                unit_scale=True,
+                unit_divisor=1024,
+            ) as bar,
+        ):
             for data in response.iter_content(chunk_size=8192):
                 size = file.write(data)
                 bar.update(size)
@@ -53,6 +58,7 @@ def download_file(url, dest_path, desc="Downloading"):
             os.remove(dest_path)
         return False
 
+
 def extract_zip(zip_path, extract_to):
     """
     ZIPファイルを指定ディレクトリに展開する関数。
@@ -60,15 +66,17 @@ def extract_zip(zip_path, extract_to):
     """
     print(f"[展開中] {zip_path} を抽出しています... (Extracting...)")
     try:
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
             zip_ref.extractall(extract_to)
         print(f"[完了] {extract_to} に展開しました。(Extraction complete)")
     except zipfile.BadZipFile:
         print(f"[エラー] 無効なZIPファイルです: {zip_path} (Invalid ZIP file)")
 
+
 # ==========================================
 # 2. 天鳳牌譜データセットの取得 (Fetch Tenhou Logs)
 # ==========================================
+
 
 def fetch_tenhou_logs():
     """
@@ -76,11 +84,11 @@ def fetch_tenhou_logs():
     （从 NikkeTryHard 仓库获取 2024 年 MJAI 格式的牌谱）
     """
     print("\n--- 天鳳牌譜データセットの取得を開始します ---")
-    
+
     # 約1.3GB, 33万局の高品質データ (事前MJAI変換済み)
     archive_url = "https://github.com/NikkeTryHard/tenhou-to-mjai/releases/download/v1.0.0/2024.zip"
     zip_dest = os.path.join(LOGS_DIR, "houou_2024_mjai.zip")
-    
+
     success = download_file(archive_url, zip_dest, desc="Tenhou 2024 MJAI Logs")
     if success:
         # 解圧先のディレクトリ (data/logs/2024_mjai/)
@@ -88,6 +96,7 @@ def fetch_tenhou_logs():
         if not os.path.exists(extract_to):
             os.makedirs(extract_to)
         extract_zip(zip_dest, extract_to)
+
 
 # ==========================================
 # メイン実行ブロック (Main Execution Block)

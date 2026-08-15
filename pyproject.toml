@@ -1,0 +1,15 @@
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "SIM"]
+ignore = [
+    "E501",   # Line too long
+    "BLE001", # Blind exception
+    "SIM105", # Contextlib suppress
+    "SIM108", # Ternary operator
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["feature_extractor", "data_builder", "rl_ppo_trainer", "supervised_trainer"]
