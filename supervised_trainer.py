@@ -111,7 +111,7 @@ class SmartMahjongMultiTaskNet(nn.Module):
         self.cross_attention = MahjongBeliefCrossAttention(cnn_dim=1024, seq_dim=256, num_heads=8, dropout_p=dropout_p)
         self.fusion_fc = nn.Sequential(nn.Linear(1024, 1024), nn.LayerNorm(1024), nn.ReLU(inplace=True), nn.Dropout(p=dropout_p))
         
-        self.policy_out = nn.Linear(1024, 47)
+        self.policy_out = nn.Linear(1024, 54)
         self.value_head = nn.Linear(1024, 1)
         
         def build_aux_mlp(in_dim, out_dim):

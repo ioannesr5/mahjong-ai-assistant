@@ -1,13 +1,107 @@
-# 忽略所有 PyTorch 模型权重
-*.pth
-
-# 忽略数据集和对手池文件夹
-data/
-model_pool/
-
-# 忽略训练曲线图表
-*.png
-
-# 忽略 Python 虚拟环境和缓存
-.venv/
+# ==========================================
+# Python 运行与字节码缓存 (Bytecode & Caches)
+# ==========================================
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ==========================================
+# 虚拟环境 (Virtual Environments)
+# ==========================================
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ==========================================
+# 代码质量与测试缓存 (Linting & Testing)
+# ==========================================
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# ==========================================
+# 模型权重与检查点 (Model Weights & Checkpoints)
+# ==========================================
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.onnx
+*.tmp
+model_pool/
+checkpoints/
+ppo_legacy_backup/
+logs_legacy_backup/
+*_backup/
+
+# ==========================================
+# 数据集与牌谱文件 (Datasets & Raw Paipu)
+# ==========================================
+data/
+datasets/
+*.h5
+*.hdf5
+*.mjson
+*.mjson.gz
+*.json.gz
+
+# ==========================================
+# 训练日志与可视化图表 (Logs & Visualizations)
+# ==========================================
+logs/
+*.log
+runs/
+wandb/
+tensorboard/
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+
+# ==========================================
+# 编辑器与 IDE 配置 (IDE & Editors)
+# ==========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.directory
+
+# ==========================================
+# 操作系统生成文件 (OS Generated Files)
+# ==========================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/

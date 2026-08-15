@@ -209,7 +209,7 @@ class SmartMahjongMultiTaskNet(nn.Module):
         self.cross_attention = MahjongBeliefCrossAttention(cnn_dim=1024, seq_dim=256, num_heads=8, dropout_p=dropout_p)
         self.fusion_fc = nn.Sequential(nn.Linear(1024, 1024), nn.LayerNorm(1024), nn.ReLU(inplace=True), nn.Dropout(p=dropout_p))
         
-        self.policy_out = nn.Linear(1024, 47)
+        self.policy_out = nn.Linear(1024, 54)
         self.value_head = nn.Linear(1024, 1)
         
         def build_aux_mlp(in_dim, out_dim):
@@ -241,6 +241,64 @@ class SmartMahjongMultiTaskNet(nn.Module):
         aux_w = self.aux_waits(hidden_aux).to(torch.float32)
 
         return p_out, v_head, aux_t, aux_d, aux_w
+
+def adapt_policy_state_dict(sd, target_actions=54):
+    """
+    47次元の旧チェックポイント重みを54次元の完全アクション空間に安全に適応・変換する
+    (Safely adapts 47-dim legacy checkpoints to 54-dim full action space)
+    """
+    if 'policy_out.weight' not in sd:
+        return sd
+    w = sd['policy_out.weight']
+    b = sd['policy_out.bias']
+    if w.shape[0] == target_actions:
+        return sd
+    if w.shape[0] == 47 and target_actions == 54:
+        new_w = torch.zeros((54, w.shape[1]), dtype=w.dtype)
+        new_b = torch.zeros(54, dtype=b.dtype)
+        
+        # 0..33: 通常打牌 (0..33)
+        new_w[0:34] = w[0:34]
+        new_b[0:34] = b[0:34]
+        
+        # 34..36: 赤宝牌打牌 (5m=4, 5p=13, 5s=22)
+        new_w[34] = w[4]; new_b[34] = b[4]
+        new_w[35] = w[13]; new_b[35] = b[13]
+        new_w[36] = w[22]; new_b[36] = b[22]
+        
+        # 37..42: チー (CHI, SLインデックス=34)
+        for i in range(37, 43):
+            new_w[i] = w[34]; new_b[i] = b[34]
+            
+        # 43..44: ポン (PON, SLインデックス=37)
+        for i in range(43, 45):
+            new_w[i] = w[37]; new_b[i] = b[37]
+            
+        # 45..47: カン (KAN, SLインデックス=39)
+        for i in range(45, 48):
+            new_w[i] = w[39]; new_b[i] = b[39]
+            
+        # 48: リーチ (RIICHI, SLインデックス=41)
+        new_w[48] = w[41]; new_b[48] = b[41]
+        
+        # 49: ロン (RON, SL和了インデックス=42)
+        new_w[49] = w[42]; new_b[49] = b[42]
+        
+        # 50: ツモ (TSUMO, SL和了インデックス=42)
+        new_w[50] = w[42]; new_b[50] = b[42]
+        
+        # 51: 九種九牌 (PUSH, SLパスインデックス=45)
+        new_w[51] = w[45]; new_b[51] = b[45]
+        
+        # 52..53: リーチパス, 応答パス (PASS, SLパスインデックス=45)
+        new_w[52] = w[45]; new_b[52] = b[45]
+        new_w[53] = w[45]; new_b[53] = b[45]
+        
+        sd_copy = dict(sd)
+        sd_copy['policy_out.weight'] = new_w
+        sd_copy['policy_out.bias'] = new_b
+        return sd_copy
+    return sd
 
 class PolicyInferenceWrapper(nn.Module):
     def __init__(self, model):
@@ -351,7 +409,7 @@ class MultiAgentMahjongEnvWrapper:
         self.action_history = [] 
         # メトリクス抽出用の変数を初期化
         self.last_discarder = -1
-        self.p0_min_shanten = 8 # 初期シャンテンの最大値
+        self.p0_min_shanten = None # 【修正】初期向聴数はNone（起手配牌時に記録し、初期手牌深度の誤加算を防止）
         self._pending_shanten_reduction = 0 # 【追加】未精算のシャンテン進速
 
     def reset_hanchan(self):
@@ -384,16 +442,19 @@ class MultiAgentMahjongEnvWrapper:
             if p == 0: reward -= 1.0
             return self._get_state_dict(), self._get_mask(), reward, True, p, info
 
-        # アクションインターセプトによるメトリクス記録
-        if 0 <= action_id <= 33: 
+        # アクションインターセプトによるメトリクス記録 (0..33: 通常打牌, 34..36: 赤宝牌打牌)
+        if 0 <= action_id <= 36: 
             self.action_history.append((p, action_id))
             self.last_discarder = p
             
-        if action_id == 42: # ロン
-            if p == 0: info['p0_win'] = True
-            elif self.last_discarder == 0: info['p0_deal_in'] = True
-        elif action_id == 43: # ツモ  # noqa: SIM102
-            if p == 0: info['p0_win'] = True
+        if action_id == 49: # ロン (RON)
+            if p == 0: 
+                info['p0_win'] = True
+            elif self.last_discarder == 0 and p != 0: 
+                info['p0_deal_in'] = True
+        elif action_id == 50: # ツモ (TSUMO)
+            if p == 0: 
+                info['p0_win'] = True
 
         self.env.step(p, action_id)
         hand_done = self.env.is_over()
@@ -436,9 +497,15 @@ class MultiAgentMahjongEnvWrapper:
         if p == 0:
             # 特徴行列の0から3のインデックスを合算し、34種の牌の枚数を復元する
             tiles34 = (obs_93[0] + obs_93[1] + obs_93[2] + obs_93[3]).astype(np.int32)
+            hand_len = int(tiles34.sum())
+            is_menzen = (hand_len in [13, 14])
             try:
-                current_shanten = self.shanten_calc.calculate_shanten(tiles34)
-                if current_shanten < self.p0_min_shanten:
+                current_shanten = self.shanten_calc.calculate_shanten(
+                    tiles34, use_chiitoitsu=is_menzen, use_kokushi=is_menzen
+                )
+                if self.p0_min_shanten is None:
+                    self.p0_min_shanten = current_shanten
+                elif current_shanten < self.p0_min_shanten:
                     self._pending_shanten_reduction += (self.p0_min_shanten - current_shanten)
                     self.p0_min_shanten = current_shanten
             except ValueError:
@@ -471,11 +538,11 @@ class MultiAgentMahjongEnvWrapper:
         return { 'state_2d': state_2d, 'cond_vec': cond_vec, 'seq_hist': seq_hist }
 
     def _get_mask(self):
-        mask = np.zeros(47, dtype=np.float32)
+        mask = np.zeros(54, dtype=np.float32)
         if not self.env.is_over():
             valid_actions = self.env.get_valid_actions()
             for act in valid_actions:
-                if act < 47: mask[act] = 1.0
+                if act < 54: mask[act] = 1.0
         return mask
 
 # ==========================================
@@ -607,12 +674,6 @@ def async_environment_worker(worker_id, shared_model, trajectory_queue, steps_to
     sync_params(shared_model, local_agent_base)
     
     wrapper = PolicyInferenceWrapper(local_agent_base)
-    dummy_s2d = torch.zeros(1, 256, 4, 9, dtype=torch.float32)
-    dummy_c = torch.zeros(1, 16, dtype=torch.float32)
-    dummy_seq = torch.zeros(1, 72, dtype=torch.int64)
-    traced_agent = torch.jit.trace(wrapper, (dummy_s2d, dummy_c, dummy_seq), check_trace=False)
-    
-    opp_models = [traced_agent for _ in range(3)]
 
     state_dict, mask, current_player = env.reset()
     pending_transition = None
@@ -623,7 +684,8 @@ def async_environment_worker(worker_id, shared_model, trajectory_queue, steps_to
     local_metrics = {'hand_count': 0, 'win_count': 0, 'deal_in_count': 0, 'shanten_reduction': 0}
 
     while True:
-        if sync_counter % 64 == 0: sync_params(shared_model, local_agent_base)
+        if sync_counter % 64 == 0:
+            sync_params(shared_model, local_agent_base)
         sync_counter += 1
 
         s_2d = torch.tensor(state_dict['state_2d'], dtype=torch.float32).unsqueeze(0)
@@ -631,11 +693,8 @@ def async_environment_worker(worker_id, shared_model, trajectory_queue, steps_to
         seq_h = torch.tensor(state_dict['seq_hist'], dtype=torch.int64).unsqueeze(0)
         t_mask = torch.tensor(mask, dtype=torch.float32).unsqueeze(0)
 
-        with torch.no_grad():
-            if current_player == 0:
-                p_out, v_score = traced_agent(s_2d, c_vec, seq_h)
-            else:
-                p_out, _ = opp_models[current_player - 1](s_2d, c_vec, seq_h)
+        with torch.inference_mode():
+            p_out, v_score = wrapper(s_2d, c_vec, seq_h)
                 
         masked_logits = p_out + (1.0 - t_mask) * -1e9
         probs = F.softmax(masked_logits, dim=-1)
@@ -802,7 +861,7 @@ class PPOKLPenaltyTrainer:
         adv_std = torch.sqrt(torch.mean((advantages - adv_mean) ** 2) + 1e-8)
         advantages = (advantages - adv_mean) / (adv_std + 1e-8)
 
-        classes = torch.arange(47, device=self.device).unsqueeze(0)
+        classes = torch.arange(54, device=self.device).unsqueeze(0)
         one_hot_actions = (actions.unsqueeze(1) == classes).to(torch.float32)
 
         total_ppo_loss = 0.0
@@ -836,7 +895,7 @@ class PPOKLPenaltyTrainer:
                     sl_out, _, sl_t, sl_d, sl_w = self.sl_model(mb_s_2d, mb_c_vec, mb_seq_h, rl_mode=False)
                     
                     if mb_masks.size(-1) == 34:
-                        full_mask = torch.zeros(mb_masks.size(0), 47, device=self.device)
+                        full_mask = torch.zeros(mb_masks.size(0), 54, device=self.device)
                         full_mask[:, :34] = mb_masks
                         full_mask[:, 34:] = 1.0 
                     else:
@@ -931,7 +990,7 @@ if __name__ == '__main__':
             break 
 
     if resume_path:
-        model.load_state_dict(torch.load(resume_path, map_location='cpu', weights_only=False))
+        model.load_state_dict(adapt_policy_state_dict(torch.load(resume_path, map_location='cpu', weights_only=False)))
         print(f" -> [Info] レジューム（断点続行）: Phase {current_phase} の履歴重み {resume_path} の検出・読み込みに成功しました")
         
         if current_phase > 1:
@@ -942,16 +1001,16 @@ if __name__ == '__main__':
             ]
             sl_resume_path = next((path for path in sl_candidates if os.path.exists(path)), base_policy_path)
             if os.path.exists(sl_resume_path):
-                sl_base_model.load_state_dict(torch.load(sl_resume_path, map_location='cpu', weights_only=False))
+                sl_base_model.load_state_dict(adapt_policy_state_dict(torch.load(sl_resume_path, map_location='cpu', weights_only=False)))
                 print(f" -> [Info] 動的SLベースライン: Phase {prev_phase} のモデルで初期化しました ({sl_resume_path})")
         else:
             if os.path.exists(base_policy_path):
-                sl_base_model.load_state_dict(torch.load(base_policy_path, map_location='cpu', weights_only=False))
+                sl_base_model.load_state_dict(adapt_policy_state_dict(torch.load(base_policy_path, map_location='cpu', weights_only=False)))
                 print(f" -> [Info] SLベースポリシーを読み込みました: {base_policy_path}")
     else:
         if os.path.exists(base_policy_path):
-            model.load_state_dict(torch.load(base_policy_path, map_location='cpu', weights_only=False))
-            sl_base_model.load_state_dict(torch.load(base_policy_path, map_location='cpu', weights_only=False))
+            model.load_state_dict(adapt_policy_state_dict(torch.load(base_policy_path, map_location='cpu', weights_only=False)))
+            sl_base_model.load_state_dict(adapt_policy_state_dict(torch.load(base_policy_path, map_location='cpu', weights_only=False)))
             print(" -> [Info] 利用可能なチェックポイントが検出されませんでした。SLベースポリシーから全く新しい Phase 1 の学習を開始します")
 
     shared_model = SmartMahjongMultiTaskNet(input_channels=256, num_blocks=18).to('cpu')
@@ -969,12 +1028,12 @@ if __name__ == '__main__':
     ckpt_manager = CheckpointManager(max_keep=3)
     logger = TrainingLogger()
     
-    trajectory_queue = mp.Queue(maxsize=NUM_WORKERS * 4 * STEPS_PER_WORKER)
+    trajectory_queue: mp.Queue = mp.Queue(maxsize=NUM_WORKERS * 4 * STEPS_PER_WORKER)
     workers = []
     for i in range(NUM_WORKERS):
-        p = mp.Process(target=async_environment_worker, args=(i, shared_model, trajectory_queue, STEPS_PER_WORKER, shared_phase))
-        p.start()
-        workers.append(p)
+        proc = mp.Process(target=async_environment_worker, args=(i, shared_model, trajectory_queue, STEPS_PER_WORKER, shared_phase))
+        proc.start()
+        workers.append(proc)
     
     reward_history_window = [] 
     eval_rank_history = []     
@@ -1132,6 +1191,6 @@ if __name__ == '__main__':
         print("\n[Warn] 訓練がユーザーによって中断されました。(Training interrupted by user.)")
     finally:
         print("-> [Info] ワーカープロセスを終了しています...")
-        for p in workers:
-            p.terminate()
-            p.join(timeout=2.0)
+        for proc in workers:
+            proc.terminate()
+            proc.join(timeout=2.0)
