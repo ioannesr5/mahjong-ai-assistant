@@ -879,7 +879,7 @@ class PPOBuffer:
 
 
 class PPOKLPenaltyTrainer:
-    def __init__(self, model, sl_model, device, num_workers, lr=5e-5, kl_beta=0.05, ppo_epochs=4):
+    def __init__(self, model, sl_model, device, num_workers, lr=1.5e-4, kl_beta=0.01, ppo_epochs=4):
         self.device = device
         self.model = model.to(self.device)
         self.sl_model = sl_model.to(self.device)
@@ -1126,11 +1126,15 @@ if __name__ == "__main__":
     # 【新增】共享内存 Phase，用于 Worker 节点动态提取塑形权重
     shared_phase = mp.Value("i", current_phase)
 
-    phase_lr_map = {1: 5e-5, 2: 1e-5, 3: 5e-6}
+    phase_lr_map = {1: 1.5e-4, 2: 3e-5, 3: 1e-5}
+    phase_kl_map = {1: 0.01, 2: 0.03, 3: 0.05}
     current_lr = phase_lr_map[current_phase]
-    print(f" -> [Info] 現在のシステム設定: Phase = {current_phase}, 学習率 = {current_lr}")
+    current_kl = phase_kl_map[current_phase]
+    print(f" -> [Info] 現在のシステム設定: Phase = {current_phase}, 学習率 = {current_lr}, KLペナルティ = {current_kl}")
 
-    trainer = PPOKLPenaltyTrainer(model, sl_base_model, device, num_workers=NUM_WORKERS, lr=current_lr, kl_beta=0.05)
+    trainer = PPOKLPenaltyTrainer(
+        model, sl_base_model, device, num_workers=NUM_WORKERS, lr=current_lr, kl_beta=current_kl
+    )
     ckpt_manager = CheckpointManager(max_keep=3)
     logger = TrainingLogger()
 
@@ -1271,7 +1275,8 @@ if __name__ == "__main__":
                                 )
                                 current_phase = 2
                                 shared_phase.value = current_phase  # 【更新】通知 Worker 更新权重
-                                trainer.set_learning_rate(1e-5)
+                                trainer.set_learning_rate(3e-5)
+                                trainer.kl_beta = 0.03
                                 best_eval_rank, best_eval_net = float("inf"), -float("inf")
                                 eval_rank_history.clear()
 
@@ -1284,7 +1289,7 @@ if __name__ == "__main__":
                                 print(
                                     "\n⚠️ [Warning] SLモデル未超過でプラトーに到達（局所最適に陥落）。Phase 2への移行をブロックします！"
                                 )
-                                new_kl = max(0.02, trainer.kl_beta * 0.5)
+                                new_kl = max(0.005, trainer.kl_beta * 0.5)
                                 print(
                                     f" -> KLペナルティ(kl_beta)を {trainer.kl_beta:.3f} から {new_kl:.3f} へ下調し、探索を促進します。"
                                 )
@@ -1298,7 +1303,8 @@ if __name__ == "__main__":
                                 )
                                 current_phase = 3
                                 shared_phase.value = current_phase  # 【更新】通知 Worker 更新权重
-                                trainer.set_learning_rate(5e-6)
+                                trainer.set_learning_rate(1e-5)
+                                trainer.kl_beta = 0.05
                                 best_eval_rank, best_eval_net = float("inf"), -float("inf")
                                 eval_rank_history.clear()
 
