@@ -524,21 +524,24 @@ class MultiAgentMahjongEnvWrapper:
                 self.scores[i] += float(payoffs[i])
             self.kyoku_count += 1
 
+            # 【修正】毎局の即時素点報酬 (Per-Hand Payoff Reward): 局終了時の点数変動を即座に報酬化
+            hand_payoff_reward = float(payoffs[0]) / 10000.0
+            reward += hand_payoff_reward
+
             # 【コアロジック】真の半荘終了を判定: 8局打ち終えたか、または点数が0未満のプレイヤー（ハコ割れ/飛び）がいる場合
             if self.kyoku_count >= 8 or np.any(self.scores < 0):
                 self.is_hanchan_done = True
 
-                # 半荘終了時にのみ、PT素点と順位ボーナスを精算する
+                # 半荘終了時に順位ボーナス（ウマ）を追加精算する
                 my_score = self.scores[0]
-                base_reward = (my_score - 25000) / 10000.0
                 rank = sum(1 for x in self.scores if x > my_score)
                 rank_bonuses = [1.0, 0.2, -0.3, -0.9]
                 bonus = rank_bonuses[min(rank, 3)]
 
-                reward = base_reward + bonus
+                reward += bonus
                 self.current_player = p
             else:
-                # 局は終了したが半荘は未終了の場合、報酬の精算は行わず、そのまま自動的に次局へ進む
+                self.is_hanchan_done = False
                 self._reset_hand_internal()
         else:
             self.current_player = self.env.get_curr_player_id()
