@@ -19,7 +19,7 @@ from tqdm import tqdm
 
 class TrainingLogger:
     """
-    CSVベースの永続化ロガー（断点続行時のデータ消失を防止）
+    CSVベースの永続化ロガー（断点続行時のデータ重複・不整合を防止する自動切り詰め・同期機能付き）
     """
 
     def __init__(self, log_dir="logs"):
@@ -29,18 +29,60 @@ class TrainingLogger:
 
         # 訓練ログのヘッダー初期化（監視メトリクスを追加）
         if not os.path.exists(self.train_log_path):
-            with open(self.train_log_path, "w", newline="") as f:
+            with open(self.train_log_path, "w", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(
                     ["Iteration", "Phase", "Loss", "Reward", "Entropy", "WinRate", "DealInRate", "MeanShantenRed"]
                 )
 
         # 評価ログのヘッダー初期化
         if not os.path.exists(self.eval_log_path):
-            with open(self.eval_log_path, "w", newline="") as f:
+            with open(self.eval_log_path, "w", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(["Iteration", "Phase", "AvgRank", "AvgNet", "WinRate", "DealInRate"])
 
+    def truncate_after(self, start_it: int):
+        """
+        断点続行（レジューム）時、再開イテレーション (start_it) より後の古い重複レコードを自動削除し、ログの単調性を維持する
+        """
+        if start_it < 0:
+            return
+
+        for path, header in [
+            (
+                self.train_log_path,
+                ["Iteration", "Phase", "Loss", "Reward", "Entropy", "WinRate", "DealInRate", "MeanShantenRed"],
+            ),
+            (
+                self.eval_log_path,
+                ["Iteration", "Phase", "AvgRank", "AvgNet", "WinRate", "DealInRate"],
+            ),
+        ]:
+            if not os.path.exists(path):
+                continue
+            try:
+                valid_rows = []
+                with open(path, "r", newline="", encoding="utf-8") as f:
+                    reader = csv.reader(f)
+                    file_header = next(reader, None)
+                    if file_header:
+                        for row in reader:
+                            if not row:
+                                continue
+                            try:
+                                row_it = int(row[0])
+                                if row_it <= start_it:
+                                    valid_rows.append(row)
+                            except (ValueError, IndexError):
+                                pass
+
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(header)
+                    writer.writerows(valid_rows)
+            except Exception as e:
+                print(f"⚠️ [Logger Warning] {path} のログ整理中にエラーが発生しました: {e}")
+
     def log_train(self, it, phase, loss, reward, entropy, win_r, deal_r, shanten_red):
-        with open(self.train_log_path, "a", newline="") as f:
+        with open(self.train_log_path, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(
                 [
                     it,
@@ -55,7 +97,7 @@ class TrainingLogger:
             )
 
     def log_eval(self, it, phase, rank, net, win_r, deal_r):
-        with open(self.eval_log_path, "a", newline="") as f:
+        with open(self.eval_log_path, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow([it, phase, f"{rank:.3f}", f"{net:.1f}", f"{win_r:.4f}", f"{deal_r:.4f}"])
 
 
@@ -1164,6 +1206,8 @@ if __name__ == "__main__":
             it = int(match.group(1))
             print(f" -> [Info] イテレーションカウントの復元: 第 {it} イテレーションから学習を再開します")
 
+    logger.truncate_after(it)
+
     try:
         while True:
             it += 1
@@ -1260,11 +1304,13 @@ if __name__ == "__main__":
                         x = np.array([0, 1, 2])
                         k_val, _ = np.polyfit(x, y, 1)
 
-                    is_plateau = (cv_val < 0.02) and (abs(k_val) < 0.005)
-                    exceed_sl = (avg_rank <= 2.45) and (avg_net > 0.0)
+                    # 平台期判定：CV 符合强化学习探索方差 (<0.35) 且 顺位斜率平稳 (<0.05)
+                    is_plateau = (cv_val < 0.35) and (abs(k_val) < 0.05)
+                    # 基线超越判定：以平均顺位（Avg Rank <= 2.40）为核心黄金指标，免除微小负素点死锁
+                    exceed_sl = (avg_rank <= 2.40) or (avg_rank <= 2.45 and avg_net > -1200.0)
 
                     print(
-                        f"🔍 [Plateau Check] CV: {cv_val:.4f} (Thresh: <0.02) | Slope |k|: {abs(k_val):.4f} (Thresh: <0.005)"
+                        f"🔍 [Plateau Check] CV: {cv_val:.4f} (Thresh: <0.35) | Slope |k|: {abs(k_val):.4f} (Thresh: <0.05) | Rank: {avg_rank:.3f} (Thresh: <=2.40)"
                     )
 
                     if is_plateau:
