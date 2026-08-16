@@ -530,12 +530,7 @@ class MultiAgentMahjongEnvWrapper:
         valid_actions = self.env.get_valid_actions()
         reward = 0.0
 
-        info = {"hand_done": False, "p0_win": False, "p0_deal_in": False, "shanten_reduction": 0}
-
-        # 【修正】アクション実行前に未精算のシャンテン進速をinfoに格納し、直ちにクリアする
-        if p == 0:
-            info["shanten_reduction"] = self._pending_shanten_reduction
-            self._pending_shanten_reduction = 0
+        info = {"hand_done": False, "p0_win": False, "p0_deal_in": False}
 
         # 異常打ち切り保護
         if action_id not in valid_actions:
@@ -639,6 +634,14 @@ class MultiAgentMahjongEnvWrapper:
         if hasattr(self, "action_history"):
             recent_history = self.action_history[-72:]
             for idx, (actor_id, tile_id) in enumerate(recent_history):
+                # 【修正】赤宝牌（34, 35, 36）を普通の5（4, 13, 22）にマッピングし、序列履歴でのパディング化（失明）を防ぐ
+                if tile_id == 34:
+                    tile_id = 4
+                elif tile_id == 35:
+                    tile_id = 13
+                elif tile_id == 36:
+                    tile_id = 22
+                
                 rel_p = (actor_id - p) % 4
                 token = int(tile_id) * 8 + rel_p * 2 + 1
                 seq_hist[idx] = min(token, 272)
@@ -826,11 +829,21 @@ def async_environment_worker(worker_id, shared_model, trajectory_queue, steps_to
             log_prob_val = dist.log_prob(action).item()
             value_val = v_score.item()
 
+            # 【修正】アクション実行「前」に、前回の打牌以降に発生した向聴進速を抽出し、前回の pending_transition に還元する（Credit Assignment Fix）
+            current_phase = shared_phase.value
+            shaping_weight = 0.02 if current_phase == 1 else (0.005 if current_phase == 2 else 0.0)
+            shaping_reward = env._pending_shanten_reduction * shaping_weight
+
             if pending_transition is not None:
+                accumulated_reward += shaping_reward
+                local_metrics["shanten_reduction"] += env._pending_shanten_reduction
+
                 pending_transition["reward"] = accumulated_reward
                 pending_transition["done"] = False
                 trajectory_queue.put(pending_transition)
-                accumulated_reward = 0.0
+                
+            accumulated_reward = 0.0
+            env._pending_shanten_reduction = 0
 
             pending_transition = {
                 "worker_id": worker_id,
@@ -845,13 +858,6 @@ def async_environment_worker(worker_id, shared_model, trajectory_queue, steps_to
 
         next_state_dict, next_mask, step_reward, done, next_player, info = env.step(action_val)
 
-        # フェーズに基づく動的報酬シェーピングの計算
-        current_phase = shared_phase.value
-        shaping_weight = 0.02 if current_phase == 1 else (0.005 if current_phase == 2 else 0.0)
-        shaping_reward = info["shanten_reduction"] * shaping_weight
-
-        # メトリクスの累積
-        local_metrics["shanten_reduction"] += info["shanten_reduction"]
         if info["p0_win"]:
             local_metrics["win_count"] += 1
         if info["p0_deal_in"]:
@@ -860,7 +866,7 @@ def async_environment_worker(worker_id, shared_model, trajectory_queue, steps_to
             local_metrics["hand_count"] += 1
 
         if pending_transition is not None:
-            accumulated_reward += float(step_reward) + shaping_reward
+            accumulated_reward += float(step_reward)
 
         if done:
             if pending_transition is not None:
