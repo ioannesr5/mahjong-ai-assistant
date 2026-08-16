@@ -550,6 +550,9 @@ class MultiAgentMahjongEnvWrapper:
                 info["p0_deal_in"] = True
         elif action_id == 50 and p == 0:  # ツモ (TSUMO)
             info["p0_win"] = True
+        elif action_id == 46 and p == 0:  # 立直 (RIICHI) - Action ID 46
+            # 【优化】为立直动作提供微小的正向补偿，克服模型对 1000 点罚符的恐惧
+            reward += 0.1
 
         self.env.step(p, action_id)
         hand_done = self.env.is_over()
@@ -572,7 +575,9 @@ class MultiAgentMahjongEnvWrapper:
                 # 半荘終了時に順位ボーナス（ウマ）を追加精算する
                 my_score = self.scores[0]
                 rank = sum(1 for x in self.scores if x > my_score)
-                rank_bonuses = [1.0, 0.2, -0.3, -0.9]
+                
+                # 【优化】加重吃四惩罚，强化避四本能 (原为 [1.0, 0.2, -0.3, -0.9])
+                rank_bonuses = [1.2, 0.3, -0.1, -1.8]
                 bonus = rank_bonuses[min(rank, 3)]
 
                 reward += bonus
