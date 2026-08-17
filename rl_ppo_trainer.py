@@ -1166,7 +1166,7 @@ if __name__ == "__main__":
     print("🚀 PPO マルチエージェント自己対局 (動的フェーズ統合 & 安全なチェックポイント保存)")
     print("=" * 60)
 
-    NUM_WORKERS = 10
+    NUM_WORKERS = 30
     STEPS_PER_WORKER = 256
     TARGET_BUFFER_SIZE = NUM_WORKERS * STEPS_PER_WORKER
 
@@ -1372,7 +1372,7 @@ if __name__ == "__main__":
             rollout_pbar.close()
 
             update_pbar = tqdm(total=trainer.ppo_epochs, desc=f"Iter [{it}] Phase {current_phase} Optim  ", leave=False)
-            ppo_loss, avg_entropy = trainer.update_from_buffer(current_phase, mini_batch_size=256)
+            ppo_loss, avg_entropy = trainer.update_from_buffer(current_phase, mini_batch_size=512)
             update_pbar.update(trainer.ppo_epochs)
             update_pbar.close()
 
