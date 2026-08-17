@@ -1000,7 +1000,7 @@ class PPOKLPenaltyTrainer:
         for g in self.optimizer.param_groups:
             g["lr"] = new_lr
 
-    def update_from_buffer(self, mini_batch_size=256):
+    def update_from_buffer(self, current_phase, mini_batch_size=256):
         all_s_2d, all_c_vec, all_seq_h = [], [], []
         all_actions, all_masks, all_old_log_probs = [], [], []
         all_advantages, all_returns, all_old_values = [], [], []
@@ -1042,11 +1042,13 @@ class PPOKLPenaltyTrainer:
             return 0.0, 0.0
 
         # 【新增】将高质量操作存入 Hero Buffer (SIL)
-        for i in range(len(all_returns)):
-            if all_returns[i] > 0.1:
-                self.hero_buffer.add(
-                    all_s_2d[i], all_c_vec[i], all_seq_h[i], all_actions[i], all_masks[i]
-                )
+        # 仅在 Phase 1/2 生效。避免在 Phase 3 陷入局部最优（见逃等高级战术需要自由探索）。
+        if current_phase < 3:
+            for i in range(len(all_returns)):
+                if all_returns[i] > 0.1:
+                    self.hero_buffer.add(
+                        all_s_2d[i], all_c_vec[i], all_seq_h[i], all_actions[i], all_masks[i]
+                    )
 
         self.model.train()
 
@@ -1136,18 +1138,19 @@ class PPOKLPenaltyTrainer:
 
                 # 【新增】计算自我模仿学习损失 (SIL Loss)
                 sil_loss_val = 0.0
-                hero_batch = self.hero_buffer.sample(128)
-                if hero_batch is not None:
-                    h_s2d, h_cvec, h_seqh, h_actions, h_masks = hero_batch
-                    h_s2d_t = torch.tensor(np.array(h_s2d), dtype=torch.float32, device=self.device)
-                    h_cvec_t = torch.tensor(np.array(h_cvec), dtype=torch.float32, device=self.device)
-                    h_seqh_t = torch.tensor(np.array(h_seqh), dtype=torch.int64, device=self.device)
-                    h_acts_t = torch.tensor(h_actions, dtype=torch.int64, device=self.device)
-                    h_masks_t = torch.tensor(np.array(h_masks), dtype=torch.float32, device=self.device)
-                    
-                    h_p_out, _, _, _, _ = self.model(h_s2d_t, h_cvec_t, h_seqh_t, rl_mode=True)
-                    h_masked_logits = h_p_out + (1.0 - h_masks_t) * -1e9
-                    sil_loss_val = F.cross_entropy(h_masked_logits, h_acts_t)
+                if current_phase < 3:
+                    hero_batch = self.hero_buffer.sample(128)
+                    if hero_batch is not None:
+                        h_s2d, h_cvec, h_seqh, h_actions, h_masks = hero_batch
+                        h_s2d_t = torch.tensor(np.array(h_s2d), dtype=torch.float32, device=self.device)
+                        h_cvec_t = torch.tensor(np.array(h_cvec), dtype=torch.float32, device=self.device)
+                        h_seqh_t = torch.tensor(np.array(h_seqh), dtype=torch.int64, device=self.device)
+                        h_acts_t = torch.tensor(h_actions, dtype=torch.int64, device=self.device)
+                        h_masks_t = torch.tensor(np.array(h_masks), dtype=torch.float32, device=self.device)
+                        
+                        h_p_out, _, _, _, _ = self.model(h_s2d_t, h_cvec_t, h_seqh_t, rl_mode=True)
+                        h_masked_logits = h_p_out + (1.0 - h_masks_t) * -1e9
+                        sil_loss_val = F.cross_entropy(h_masked_logits, h_acts_t)
 
                 total_loss = policy_loss + 1.0 * value_loss - 0.01 * entropy + self.kl_beta * kl_div + aux_loss + 0.1 * sil_loss_val
 
@@ -1321,7 +1324,7 @@ if __name__ == "__main__":
             rollout_pbar.close()
 
             update_pbar = tqdm(total=trainer.ppo_epochs, desc=f"Iter [{it}] Phase {current_phase} Optim  ", leave=False)
-            ppo_loss, avg_entropy = trainer.update_from_buffer(mini_batch_size=256)
+            ppo_loss, avg_entropy = trainer.update_from_buffer(current_phase, mini_batch_size=256)
             update_pbar.update(trainer.ppo_epochs)
             update_pbar.close()
 
