@@ -810,7 +810,7 @@ def async_environment_worker(worker_id, request_queue, response_pipe, trajectory
     while True:
         request_queue.put({
             "worker_id": worker_id,
-            "state_2d": state_dict["state_2d"].astype(np.int8),  # 【极速优化 1】36KB -> 9KB，彻底消除 Pickle 进程通信瓶颈
+            "state_2d": state_dict["state_2d"].astype(np.int8),  # [高速化1] 36KB -> 9KB、Pickle通信のボトルネックを完全に解消
             "cond_vec": state_dict["cond_vec"],
             "seq_hist": state_dict["seq_hist"].astype(np.int16),
             "mask": mask.astype(np.int8)
@@ -823,7 +823,7 @@ def async_environment_worker(worker_id, request_queue, response_pipe, trajectory
             log_prob_val = response["log_prob"]
             value_val = response["value"]
 
-            # 【修正】アクション実行「前」に、前回の打牌以降に発生した向聴進速を抽出し、前回の pending_transition に還元する（Credit Assignment Fix）
+            # [修正] アクション実行「前」に、前回の打牌以降に発生した向聴進速を抽出し、前回の pending_transition に還元する（Credit Assignment Fix）
             current_phase = shared_phase.value
             shaping_weight = 0.02 if current_phase == 1 else (0.005 if current_phase == 2 else 0.0)
             shaping_reward = env._pending_shanten_reduction * shaping_weight
@@ -839,7 +839,7 @@ def async_environment_worker(worker_id, request_queue, response_pipe, trajectory
             accumulated_reward = 0.0
             env._pending_shanten_reduction = 0
 
-            # 【新增】进张面 (Ukeire) 即时奖励
+            # [追加] 受入(Ukeire)の即時報酬
             if action_val < 34:
                 obs_93 = env.env.get_obs(0)
                 tiles34 = (obs_93[0] + obs_93[1] + obs_93[2] + obs_93[3]).astype(np.int32)
@@ -860,7 +860,7 @@ def async_environment_worker(worker_id, request_queue, response_pipe, trajectory
                                     pass
                                 tiles34[i] -= 1
                         
-                        # 每多1张有效进张，奖励 +0.0005
+                        # 有効牌が1枚増えるごとに +0.0005 の報酬
                         accumulated_reward += ukeire_count * 0.0005
                     except ValueError:
                         pass
@@ -1295,7 +1295,7 @@ if __name__ == "__main__":
             iteration_reward = 0.0
             added_steps = 0
 
-            # 【新增】日常追踪指标
+            # [追加] 日常追跡指標
             total_hands, total_wins, total_deal_ins, total_shanten_reduction = 0, 0, 0, 0
 
             import queue
@@ -1304,7 +1304,7 @@ if __name__ == "__main__":
                 total=TARGET_BUFFER_SIZE, desc=f"Iter [{it}] Phase {current_phase} Async Rollout", leave=False
             )
             while added_steps < TARGET_BUFFER_SIZE:
-                # 1. 收集 Worker 传回的完整轨迹数据（非阻塞）
+                # 1. Workerからの完全な軌跡データを収集（ノンブロッキング）
                 while not trajectory_queue.empty():
                     step_data = trajectory_queue.get()
                     trainer.buffer.add(step_data["worker_id"], step_data)
@@ -1325,13 +1325,13 @@ if __name__ == "__main__":
                 if added_steps >= TARGET_BUFFER_SIZE:
                     break
                     
-                # 2. 集中式 GPU 批量推理 (Central Batch Inference)
+                # 2. 集中型GPUバッチ推論 (Central Batch Inference)
                 requests = []
                 try:
-                    # 阻塞等待最多 0.01 秒，抓取至少 1 个请求
+                    # 最大0.01秒ブロックして、少なくとも1つのリクエストを捕捉
                     req = request_queue.get(timeout=0.01)
                     requests.append(req)
-                    # 【新增】微批处理延迟 (Micro-Batching Delay)：强行额外等待 0.002 秒，强制组建大 Batch，彻底榨干 GPU
+                    # [追加] マイクロバッチ遅延 (Micro-Batching Delay): 強制的に0.002秒余分に待機し、大きなバッチを構成してGPUを最大限に活用する
                     while len(requests) < NUM_WORKERS:
                         try:
                             requests.append(request_queue.get(timeout=0.002))
@@ -1341,13 +1341,13 @@ if __name__ == "__main__":
                     pass
                     
                 if requests:
-                    # 拼接 Batch
+                    # バッチの結合
                     b_s2d = torch.tensor(np.array([r["state_2d"] for r in requests]), dtype=torch.float32, device=device)
                     b_cvec = torch.tensor(np.array([r["cond_vec"] for r in requests]), dtype=torch.float32, device=device)
                     b_seqh = torch.tensor(np.array([r["seq_hist"] for r in requests]), dtype=torch.int64, device=device)
                     b_mask = torch.tensor(np.array([r["mask"] for r in requests]), dtype=torch.float32, device=device)
                     
-                    # GPU 前向传播
+                    # GPUフォワードパス
                     with torch.no_grad():
                         p_out, v_score, _, _, _ = trainer.model(b_s2d, b_cvec, b_seqh, rl_mode=True)
                         masked_logits = p_out + (1.0 - b_mask) * -1e9
@@ -1360,7 +1360,7 @@ if __name__ == "__main__":
                     v_score_np = v_score.squeeze(-1).cpu().numpy()
                     log_probs_np = log_probs.cpu().numpy()
                     
-                    # 通过 Pipe 将结果精确分发回对应的 Worker
+                    # Pipe経由で結果を対応するWorkerに正確に分配
                     for idx, r in enumerate(requests):
                         w_id = r["worker_id"]
                         parent_pipes[w_id].send({
@@ -1475,12 +1475,12 @@ if __name__ == "__main__":
                                 eval_rank_history.clear()
 
                         elif current_phase == 2:
-                            # 【修正】Phase 2 晋升 Phase 3 必须用“实打实的和牌”证明自己
-                            # 剔除靠“流局听牌罚符（No-Ten Bappu）”混分苟进阶的可能。必须强制要求和了率 >= 5%
+                            # [修正] Phase 2からPhase 3への昇格は「実際の和了」で証明する必要がある
+                            # 「流局聴牌罰符 (No-Ten Bappu)」だけでポイントを稼ぎ昇格する可能性を排除。和了率 >= 5% を強制
                             phase2_exceed = exceed_sl and (win_r >= 0.05)
                             if phase2_exceed:
                                 print(
-                                    f"\n🌟 [Phase Transition] Phase 2 达标 (Rank:{avg_rank:.3f}, WinR:{win_r:.2%})。最终阶段 Phase 3 开启！"
+                                    f"\n🌟 [Phase Transition] Phase 2 基準達成 (Rank:{avg_rank:.3f}, WinR:{win_r:.2%})。最終段階 Phase 3 を開始します！"
                                 )
                                 current_phase = 3
                                 shared_phase.value = current_phase  # 【更新】通知 Worker 更新权重
@@ -1500,15 +1500,30 @@ if __name__ == "__main__":
                                 eval_rank_history.clear()
 
                         elif current_phase == 3:
-                            print(
-                                "\n🛑 [Training Complete] Phase 3 でプラトーに到達しました。学習を完了し、最終モデルを保存して終了します。"
-                            )
-                            final_model_path = "smart_mahjong_ppo_final_phase3.pth"
-                            ckpt_manager.safe_save(trainer.model.state_dict(), final_model_path)
-                            print(f" -> 最終モデルを保存: {final_model_path}")
-                            break
+                            # [追加] Phase 3 最終卒業条件
+                            # 対戦相手は Phase 2 の卒業モデル。同レベルの対戦では Rank 2.5 が引き分け。
+                            # Rank <= 2.45 かつ 純スコア > 0 を達成し、純粋なRLがUkeireヒューリスティックモデルを確実に超えたことを証明する必要がある。
+                            phase3_success = (avg_rank <= 2.45) and (avg_net > 0)
+                            
+                            if phase3_success:
+                                print(
+                                    f"\n👑 [Grand Finale] Phase 3 完璧にクリア！(Rank:{avg_rank:.3f}, Net:{avg_net:.1f}pt)。"
+                                )
+                                print(" -> 純粋な強化学習が Phase 2 ヒューリスティックモデルを成功裏に超え、AIは極致に達しました！")
+                                final_model_path = "smart_mahjong_ppo_final_phase3_MASTER.pth"
+                                ckpt_manager.safe_save(trainer.model.state_dict(), final_model_path)
+                                print(f" -> 最終マスターモデルを保存しました: {final_model_path}")
+                                break
+                            else:
+                                print(
+                                    f"\n⚠️ [Warning] Phase 3 がプラトーに達しましたが、Phase 2 のベースラインに勝てませんでした (Rank:{avg_rank:.3f}, Net:{avg_net:.1f}pt)。"
+                                )
+                                new_kl = max(0.001, trainer.kl_beta * 0.5)
+                                print(f" -> KLペナルティを {new_kl:.4f} に引き下げ、モデルの探索能力を解放し、凡庸を拒否して学習を続行します！")
+                                trainer.kl_beta = new_kl
+                                eval_rank_history.clear()
 
-            if it % 50 == 0:
+            if it % 10 == 0:
                 ckpt_manager.save_with_rotation(
                     trainer.model.state_dict(), "smart_mahjong_ppo_latest", current_phase, it
                 )
