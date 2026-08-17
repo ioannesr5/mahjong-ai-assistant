@@ -1495,8 +1495,13 @@ if __name__ == "__main__":
                                 sl_base_model.load_state_dict(trainer.model.state_dict())
                             else:
                                 print(
-                                    "\n⚠️ [Warning] Phase 2 でプラトーに到達しましたが、基線を超越していません。探索を継続します。"
+                                    f"\n⚠️ [Warning] Phase 2 でプラトーに到達しましたが、昇格基準未達です (Rank:{avg_rank:.3f}, WinR:{win_r:.2%})。"
                                 )
+                                new_kl = max(0.003, trainer.kl_beta * 0.7)
+                                print(
+                                    f" -> KLペナルティ(kl_beta)を {trainer.kl_beta:.4f} から {new_kl:.4f} へ引き下げ、攻撃・和了への探索を促進します！"
+                                )
+                                trainer.kl_beta = new_kl
                                 eval_rank_history.clear()
 
                         elif current_phase == 3:
