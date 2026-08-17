@@ -1475,9 +1475,12 @@ if __name__ == "__main__":
                                 eval_rank_history.clear()
 
                         elif current_phase == 2:
-                            if exceed_sl:
+                            # 【修正】Phase 2 晋升 Phase 3 必须用“实打实的和牌”证明自己
+                            # 剔除靠“流局听牌罚符（No-Ten Bappu）”混分苟进阶的可能。必须强制要求和了率 >= 5%
+                            phase2_exceed = exceed_sl and (win_r >= 0.05)
+                            if phase2_exceed:
                                 print(
-                                    "\n🌟 [Phase Transition] Phase 2 でプラトーに到達。最終段階 Phase 3 (極限微調整) に移行します！"
+                                    f"\n🌟 [Phase Transition] Phase 2 达标 (Rank:{avg_rank:.3f}, WinR:{win_r:.2%})。最终阶段 Phase 3 开启！"
                                 )
                                 current_phase = 3
                                 shared_phase.value = current_phase  # 【更新】通知 Worker 更新权重
