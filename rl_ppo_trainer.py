@@ -796,14 +796,8 @@ def sync_params(src_model, dst_model):
         dst_p.data.copy_(src_p.data)
 
 
-def async_environment_worker(worker_id, shared_model, trajectory_queue, steps_to_collect, shared_phase):
+def async_environment_worker(worker_id, request_queue, response_pipe, trajectory_queue, steps_to_collect, shared_phase):
     env = MultiAgentMahjongEnvWrapper()
-
-    local_agent_base = SmartMahjongMultiTaskNet(input_channels=256, num_blocks=18).to("cpu")
-    local_agent_base.eval()
-    sync_params(shared_model, local_agent_base)
-
-    wrapper = PolicyInferenceWrapper(local_agent_base)
 
     state_dict, mask, current_player = env.reset()
     pending_transition = None
@@ -814,27 +808,20 @@ def async_environment_worker(worker_id, shared_model, trajectory_queue, steps_to
     local_metrics = {"hand_count": 0, "win_count": 0, "deal_in_count": 0, "shanten_reduction": 0}
 
     while True:
-        if sync_counter % 64 == 0:
-            sync_params(shared_model, local_agent_base)
-        sync_counter += 1
-
-        s_2d = torch.tensor(state_dict["state_2d"], dtype=torch.float32).unsqueeze(0)
-        c_vec = torch.tensor(state_dict["cond_vec"], dtype=torch.float32).unsqueeze(0)
-        seq_h = torch.tensor(state_dict["seq_hist"], dtype=torch.int64).unsqueeze(0)
-        t_mask = torch.tensor(mask, dtype=torch.float32).unsqueeze(0)
-
-        with torch.inference_mode():
-            p_out, v_score = wrapper(s_2d, c_vec, seq_h)
-
-        masked_logits = p_out + (1.0 - t_mask) * -1e9
-        probs = F.softmax(masked_logits, dim=-1)
-        dist = torch.distributions.Categorical(probs)
-        action = dist.sample()
-        action_val = action.item()
-
+        request_queue.put({
+            "worker_id": worker_id,
+            "state_2d": state_dict["state_2d"].astype(np.int8),  # 【极速优化 1】36KB -> 9KB，彻底消除 Pickle 进程通信瓶颈
+            "cond_vec": state_dict["cond_vec"],
+            "seq_hist": state_dict["seq_hist"].astype(np.int16),
+            "mask": mask.astype(np.int8)
+        })
+        
+        response = response_pipe.recv()
+        action_val = response["action"]
+        
         if current_player == 0:
-            log_prob_val = dist.log_prob(action).item()
-            value_val = v_score.item()
+            log_prob_val = response["log_prob"]
+            value_val = response["value"]
 
             # 【修正】アクション実行「前」に、前回の打牌以降に発生した向聴進速を抽出し、前回の pending_transition に還元する（Credit Assignment Fix）
             current_phase = shared_phase.value
@@ -1248,10 +1235,6 @@ if __name__ == "__main__":
                 " -> [Info] 利用可能なチェックポイントが検出されませんでした。SLベースポリシーから全く新しい Phase 1 の学習を開始します"
             )
 
-    shared_model = SmartMahjongMultiTaskNet(input_channels=256, num_blocks=18).to("cpu")
-    shared_model.load_state_dict(model.state_dict())
-    shared_model.share_memory()
-
     # 【新增】共享内存 Phase，用于 Worker 节点动态提取塑形权重
     shared_phase = mp.Value("i", current_phase)
 
@@ -1268,10 +1251,21 @@ if __name__ == "__main__":
     logger = TrainingLogger()
 
     trajectory_queue: mp.Queue = mp.Queue(maxsize=NUM_WORKERS * 4 * STEPS_PER_WORKER)
+    
+    # 【新增】建立集中式批量推理 IPC 通道
+    request_queue: mp.Queue = mp.Queue()
+    parent_pipes = []
+    child_pipes = []
+    for _ in range(NUM_WORKERS):
+        p, c = mp.Pipe()
+        parent_pipes.append(p)
+        child_pipes.append(c)
+
     workers = []
     for i in range(NUM_WORKERS):
         proc = mp.Process(
-            target=async_environment_worker, args=(i, shared_model, trajectory_queue, STEPS_PER_WORKER, shared_phase)
+            target=async_environment_worker, 
+            args=(i, request_queue, child_pipes[i], trajectory_queue, STEPS_PER_WORKER, shared_phase)
         )
         proc.start()
         workers.append(proc)
@@ -1304,32 +1298,83 @@ if __name__ == "__main__":
             # 【新增】日常追踪指标
             total_hands, total_wins, total_deal_ins, total_shanten_reduction = 0, 0, 0, 0
 
+            import queue
+
             rollout_pbar = tqdm(
                 total=TARGET_BUFFER_SIZE, desc=f"Iter [{it}] Phase {current_phase} Async Rollout", leave=False
             )
             while added_steps < TARGET_BUFFER_SIZE:
-                step_data = trajectory_queue.get()
-                trainer.buffer.add(step_data["worker_id"], step_data)
-                iteration_reward += step_data["reward"]
-                added_steps += 1
+                # 1. 收集 Worker 传回的完整轨迹数据（非阻塞）
+                while not trajectory_queue.empty():
+                    step_data = trajectory_queue.get()
+                    trainer.buffer.add(step_data["worker_id"], step_data)
+                    iteration_reward += step_data["reward"]
+                    added_steps += 1
+                    rollout_pbar.update(1)
 
-                if step_data["done"] and "metrics" in step_data:
-                    m = step_data["metrics"]
-                    total_hands += m["hand_count"]
-                    total_wins += m["win_count"]
-                    total_deal_ins += m["deal_in_count"]
-                    total_shanten_reduction += m["shanten_reduction"]
+                    if step_data["done"] and "metrics" in step_data:
+                        m = step_data["metrics"]
+                        total_hands += m["hand_count"]
+                        total_wins += m["win_count"]
+                        total_deal_ins += m["deal_in_count"]
+                        total_shanten_reduction += m["shanten_reduction"]
+                        
+                    if added_steps >= TARGET_BUFFER_SIZE:
+                        break
+                        
+                if added_steps >= TARGET_BUFFER_SIZE:
+                    break
+                    
+                # 2. 集中式 GPU 批量推理 (Central Batch Inference)
+                requests = []
+                try:
+                    # 阻塞等待最多 0.01 秒，抓取至少 1 个请求
+                    req = request_queue.get(timeout=0.01)
+                    requests.append(req)
+                    # 【新增】微批处理延迟 (Micro-Batching Delay)：强行额外等待 0.002 秒，强制组建大 Batch，彻底榨干 GPU
+                    while len(requests) < NUM_WORKERS:
+                        try:
+                            requests.append(request_queue.get(timeout=0.002))
+                        except queue.Empty:
+                            break
+                except queue.Empty:
+                    pass
+                    
+                if requests:
+                    # 拼接 Batch
+                    b_s2d = torch.tensor(np.array([r["state_2d"] for r in requests]), dtype=torch.float32, device=device)
+                    b_cvec = torch.tensor(np.array([r["cond_vec"] for r in requests]), dtype=torch.float32, device=device)
+                    b_seqh = torch.tensor(np.array([r["seq_hist"] for r in requests]), dtype=torch.int64, device=device)
+                    b_mask = torch.tensor(np.array([r["mask"] for r in requests]), dtype=torch.float32, device=device)
+                    
+                    # GPU 前向传播
+                    with torch.no_grad():
+                        p_out, v_score, _, _, _ = trainer.model(b_s2d, b_cvec, b_seqh, rl_mode=True)
+                        masked_logits = p_out + (1.0 - b_mask) * -1e9
+                        probs = F.softmax(masked_logits, dim=-1)
+                        dist = torch.distributions.Categorical(probs)
+                        actions = dist.sample()
+                        log_probs = dist.log_prob(actions)
+                        
+                    actions_np = actions.cpu().numpy()
+                    v_score_np = v_score.squeeze(-1).cpu().numpy()
+                    log_probs_np = log_probs.cpu().numpy()
+                    
+                    # 通过 Pipe 将结果精确分发回对应的 Worker
+                    for idx, r in enumerate(requests):
+                        w_id = r["worker_id"]
+                        parent_pipes[w_id].send({
+                            "action": int(actions_np[idx]),
+                            "value": float(v_score_np[idx]),
+                            "log_prob": float(log_probs_np[idx])
+                        })
 
-                rollout_pbar.update(1)
             rollout_pbar.close()
 
             update_pbar = tqdm(total=trainer.ppo_epochs, desc=f"Iter [{it}] Phase {current_phase} Optim  ", leave=False)
             ppo_loss, avg_entropy = trainer.update_from_buffer(current_phase, mini_batch_size=256)
             update_pbar.update(trainer.ppo_epochs)
             update_pbar.close()
-
-            sync_params(trainer.model.to("cpu"), shared_model)
-            trainer.model.to(device)
 
             gc.collect()
             if torch.cuda.is_available():
