@@ -3,7 +3,9 @@ import gc
 import glob
 import math
 import os
+import random
 import re
+from collections import deque
 
 import numpy as np
 import pymahjong  # type: ignore
@@ -850,6 +852,32 @@ def async_environment_worker(worker_id, shared_model, trajectory_queue, steps_to
             accumulated_reward = 0.0
             env._pending_shanten_reduction = 0
 
+            # 【新增】进张面 (Ukeire) 即时奖励
+            if action_val < 34:
+                obs_93 = env.env.get_obs(0)
+                tiles34 = (obs_93[0] + obs_93[1] + obs_93[2] + obs_93[3]).astype(np.int32)
+                if tiles34[action_val] > 0:
+                    tiles34[action_val] -= 1
+                    is_menzen = int(tiles34.sum()) in [13, 14]
+                    try:
+                        base_shanten = env.shanten_calc.calculate_shanten(tiles34, use_chiitoitsu=is_menzen, use_kokushi=is_menzen)
+                        ukeire_count = 0
+                        for i in range(34):
+                            if tiles34[i] < 4:
+                                tiles34[i] += 1
+                                try:
+                                    new_s = env.shanten_calc.calculate_shanten(tiles34, use_chiitoitsu=is_menzen, use_kokushi=is_menzen)
+                                    if new_s < base_shanten:
+                                        ukeire_count += (5 - tiles34[i])
+                                except ValueError:
+                                    pass
+                                tiles34[i] -= 1
+                        
+                        # 每多1张有效进张，奖励 +0.0005
+                        accumulated_reward += ukeire_count * 0.0005
+                    except ValueError:
+                        pass
+
             pending_transition = {
                 "worker_id": worker_id,
                 "state_2d": state_dict["state_2d"],
@@ -895,6 +923,28 @@ def directml_safe_bce_with_logits(logits, targets):
     probs = torch.sigmoid(logits)
     probs = torch.clamp(probs, 1e-7, 1.0 - 1e-7)
     return -(targets * torch.log(probs) + (1.0 - targets) * torch.log(1.0 - probs)).mean()
+
+
+class HeroReplayBuffer:
+    def __init__(self, max_size=10000):
+        self.buffer = deque(maxlen=max_size)
+        
+    def add(self, s_2d, c_vec, seq_h, action, mask):
+        self.buffer.append((s_2d, c_vec, seq_h, action, mask))
+        
+    def sample(self, batch_size):
+        if len(self.buffer) == 0:
+            return None
+        batch_size = min(batch_size, len(self.buffer))
+        batch = random.sample(self.buffer, batch_size)
+        
+        s_2d = [item[0] for item in batch]
+        c_vec = [item[1] for item in batch]
+        seq_h = [item[2] for item in batch]
+        actions = [item[3] for item in batch]
+        masks = [item[4] for item in batch]
+        
+        return s_2d, c_vec, seq_h, actions, masks
 
 
 class PPOBuffer:
@@ -944,6 +994,7 @@ class PPOKLPenaltyTrainer:
         self.gamma = 0.99
         self.gae_lambda = 0.95
         self.buffer = PPOBuffer(num_workers)
+        self.hero_buffer = HeroReplayBuffer(max_size=10000)
 
     def set_learning_rate(self, new_lr):
         for g in self.optimizer.param_groups:
@@ -989,6 +1040,13 @@ class PPOKLPenaltyTrainer:
 
         if total_steps == 0:
             return 0.0, 0.0
+
+        # 【新增】将高质量操作存入 Hero Buffer (SIL)
+        for i in range(len(all_returns)):
+            if all_returns[i] > 0.1:
+                self.hero_buffer.add(
+                    all_s_2d[i], all_c_vec[i], all_seq_h[i], all_actions[i], all_masks[i]
+                )
 
         self.model.train()
 
@@ -1076,7 +1134,22 @@ class PPOKLPenaltyTrainer:
                 loss_aux_w = directml_safe_bce_with_logits(aux_w, sl_w_target)
                 aux_loss = 0.05 * (loss_aux_t + loss_aux_d + loss_aux_w)
 
-                total_loss = policy_loss + 1.0 * value_loss - 0.01 * entropy + self.kl_beta * kl_div + aux_loss
+                # 【新增】计算自我模仿学习损失 (SIL Loss)
+                sil_loss_val = 0.0
+                hero_batch = self.hero_buffer.sample(128)
+                if hero_batch is not None:
+                    h_s2d, h_cvec, h_seqh, h_actions, h_masks = hero_batch
+                    h_s2d_t = torch.tensor(np.array(h_s2d), dtype=torch.float32, device=self.device)
+                    h_cvec_t = torch.tensor(np.array(h_cvec), dtype=torch.float32, device=self.device)
+                    h_seqh_t = torch.tensor(np.array(h_seqh), dtype=torch.int64, device=self.device)
+                    h_acts_t = torch.tensor(h_actions, dtype=torch.int64, device=self.device)
+                    h_masks_t = torch.tensor(np.array(h_masks), dtype=torch.float32, device=self.device)
+                    
+                    h_p_out, _, _, _, _ = self.model(h_s2d_t, h_cvec_t, h_seqh_t, rl_mode=True)
+                    h_masked_logits = h_p_out + (1.0 - h_masks_t) * -1e9
+                    sil_loss_val = F.cross_entropy(h_masked_logits, h_acts_t)
+
+                total_loss = policy_loss + 1.0 * value_loss - 0.01 * entropy + self.kl_beta * kl_div + aux_loss + 0.1 * sil_loss_val
 
                 self.optimizer.zero_grad()
                 total_loss.backward()
