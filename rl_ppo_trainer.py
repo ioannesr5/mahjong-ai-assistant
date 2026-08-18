@@ -4,24 +4,50 @@ import glob
 import os
 import random
 import re
+import sys
 from collections import deque
 
 import numpy as np
-import pymahjong  # type: ignore
 import torch
 import torch.nn.functional as F
 import torch_directml
-from mahjong.shanten import Shanten  # 【新增】外部向听数计算器 (外部シャンテン数計算器)
 from torch import multiprocessing as mp
 from torch import nn
 from tqdm import tqdm
 
 import actions as A
+from mahjong_env import MultiAgentMahjongEnvWrapper
 from models import (
     DirectMLSafeAdamW,
     SmartMahjongMultiTaskNet,
     directml_safe_bce_with_logits,
+    directml_safe_masked_sample,
+    masked_log_probs,
 )
+from reward import (
+    COMPONENTS,
+    RewardConfig,
+    RewardDecomposition,
+    hanchan_rank_bonus,
+    ukeire_count,
+)
+
+
+def _use_utf8_stdout() -> None:
+    """Windows の既定コンソール (cp932/gbk) で日本語ログが落ちないようにする"""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+_use_utf8_stdout()
+
+
+# 報酬成分を個別に記録する (旧: 1 つのスカラーしか無く、学習を動かしている要因を切り分けられなかった)
+TRAIN_LOG_HEADER = [
+    "Iteration", "Phase", "Loss", "Reward", "Entropy", "WinRate", "DealInRate", "MeanShantenRed",
+    *[f"R_{name}" for name in COMPONENTS],
+]
 
 
 class TrainingLogger:
@@ -38,7 +64,7 @@ class TrainingLogger:
         if not os.path.exists(self.train_log_path):
             with open(self.train_log_path, "w", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(
-                    ["Iteration", "Phase", "Loss", "Reward", "Entropy", "WinRate", "DealInRate", "MeanShantenRed"]
+                    TRAIN_LOG_HEADER
                 )
 
         # 評価ログのヘッダー初期化
@@ -56,7 +82,7 @@ class TrainingLogger:
         for path, header in [
             (
                 self.train_log_path,
-                ["Iteration", "Phase", "Loss", "Reward", "Entropy", "WinRate", "DealInRate", "MeanShantenRed"],
+                TRAIN_LOG_HEADER,
             ),
             (
                 self.eval_log_path,
@@ -88,7 +114,8 @@ class TrainingLogger:
             except Exception as e:
                 print(f"⚠️ [Logger Warning] {path} のログ整理中にエラーが発生しました: {e}")
 
-    def log_train(self, it, phase, loss, reward, entropy, win_r, deal_r, shanten_red):
+    def log_train(self, it, phase, loss, reward, entropy, win_r, deal_r, shanten_red, parts=None):
+        parts = parts or {}
         with open(self.train_log_path, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(
                 [
@@ -100,12 +127,66 @@ class TrainingLogger:
                     f"{win_r:.4f}",
                     f"{deal_r:.4f}",
                     f"{shanten_red:.4f}",
+                    *[f"{parts.get(name, 0.0):.4f}" for name in COMPONENTS],
                 ]
             )
 
     def log_eval(self, it, phase, rank, net, win_r, deal_r):
         with open(self.eval_log_path, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow([it, phase, f"{rank:.3f}", f"{net:.1f}", f"{win_r:.4f}", f"{deal_r:.4f}"])
+
+
+CHECKPOINT_FORMAT = 2  # 1 = 生の state_dict、2 = 学習状態を含む辞書
+
+
+def build_checkpoint(model, trainer, phase, iteration, reward_config, extra=None):
+    """
+    【修正】旧実装は model.state_dict() だけを保存していたため
+      * optimizer / scheduler / phase / kl_beta が失われ、再開のたびに学習が不連続になる
+      * TRUE_BEST (ファイル名に _iter が無い) から再開すると it が 0 に戻り、
+        直後の logger.truncate_after(0) が CSV 全体を消し飛ばす
+      * どの報酬設定・どの seed で得た重みか後から辿れない
+    という問題があった。学習状態を丸ごと保存する。
+    """
+    return {
+        "format": CHECKPOINT_FORMAT,
+        "model": model.state_dict(),
+        "optimizer": trainer.optimizer.state_dict(),
+        "phase": phase,
+        "iteration": iteration,
+        "kl_beta": trainer.kl_beta,
+        "gamma": trainer.gamma,
+        "reward_config": reward_config.as_dict(),
+        "torch_rng": torch.get_rng_state(),
+        "numpy_rng": np.random.get_state(),
+        "python_rng": random.getstate(),
+        **(extra or {}),
+    }
+
+
+def extract_model_state(payload):
+    """新旧どちらの形式のチェックポイントからでもモデル重みを取り出す"""
+    if isinstance(payload, dict) and "model" in payload and "format" in payload:
+        return payload["model"]
+    return payload
+
+
+def restore_training_state(payload, trainer):
+    """辞書形式なら optimizer / kl_beta / RNG も復元し、再開イテレーションを返す"""
+    if not (isinstance(payload, dict) and payload.get("format") == CHECKPOINT_FORMAT):
+        return None
+    try:
+        trainer.optimizer.load_state_dict(payload["optimizer"])
+    except (ValueError, KeyError) as exc:
+        print(f" -> [Warn] optimizer 状態の復元に失敗しました ({exc})。初期状態から続行します")
+    trainer.kl_beta = payload.get("kl_beta", trainer.kl_beta)
+    if "torch_rng" in payload:
+        torch.set_rng_state(payload["torch_rng"])
+    if "numpy_rng" in payload:
+        np.random.set_state(payload["numpy_rng"])
+    if "python_rng" in payload:
+        random.setstate(payload["python_rng"])
+    return payload.get("iteration")
 
 
 class CheckpointManager:
@@ -338,270 +419,6 @@ class PolicyInferenceWrapper(nn.Module):
 
 
 # ==========================================
-# 3. マルチエージェント自己対局環境 (監視 & 報酬シェーピング対応版)
-# ==========================================
-def decode_obs_93_to_256(obs_93: np.ndarray, self_scores: np.ndarray, p_id: int) -> np.ndarray:
-    obs_93 = obs_93.astype(np.float32)
-    state = np.zeros((256, 34), dtype=np.float32)
-    state[0:4] = obs_93[0:4]
-    state[4, 4] = obs_93[5, 4]
-    state[5, 13] = obs_93[5, 13]
-    state[6, 22] = obs_93[5, 22]
-
-    for i in range(4):
-        ob_base = 6 + i * 6
-        st_base = 7 + i * 12
-        state[st_base : st_base + 4] = obs_93[ob_base : ob_base + 4]
-        is_dora = np.clip(obs_93[74] + obs_93[75] + obs_93[76] + obs_93[77], 0, 1)
-        state[st_base + 10] = obs_93[ob_base] * is_dora
-        state[st_base + 11] = obs_93[ob_base + 5]
-
-    for i in range(4):
-        ob_base = 30 + i * 10
-        st_base = 55 + i * 24
-        tegiri = obs_93[ob_base + 4 : ob_base + 8]
-        state[st_base : st_base + 4] = tegiri
-        total_disc = obs_93[ob_base : ob_base + 4]
-        state[st_base + 4 : st_base + 8] = np.clip(total_disc - tegiri, 0, 1)
-        state[st_base + 8] = obs_93[ob_base + 9]
-        state[st_base + 9 : st_base + 13] = np.clip(total_disc - obs_93[ob_base + 9], 0, 1)
-
-    state[151:155] = obs_93[70:74]
-
-    vis = (
-        obs_93[0]
-        + obs_93[6]
-        + obs_93[12]
-        + obs_93[18]
-        + obs_93[24]
-        + obs_93[30]
-        + obs_93[40]
-        + obs_93[50]
-        + obs_93[60]
-        + obs_93[70]
-    )
-    vis = np.clip(vis, 0, 4)
-
-    for i in range(4):
-        ob_base = 30 + i * 10
-        st_base = 171 + i * 10
-        genbutsu = obs_93[ob_base] > 0
-        state[st_base + 0] = genbutsu
-        for suit in range(3):
-            off = suit * 9
-            state[st_base + 1, off + 0] = genbutsu[off + 3]
-            state[st_base + 1, off + 1] = genbutsu[off + 4]
-            state[st_base + 1, off + 2] = genbutsu[off + 5]
-            state[st_base + 1, off + 3] = genbutsu[off + 0] * genbutsu[off + 6]
-            state[st_base + 1, off + 4] = genbutsu[off + 1] * genbutsu[off + 7]
-            state[st_base + 1, off + 5] = genbutsu[off + 2] * genbutsu[off + 8]
-            state[st_base + 1, off + 6] = genbutsu[off + 3]
-            state[st_base + 1, off + 7] = genbutsu[off + 4]
-            state[st_base + 1, off + 8] = genbutsu[off + 5]
-
-            state[st_base + 2, off + 0] = vis[off + 1] == 4
-            state[st_base + 2, off + 1] = vis[off + 2] == 4
-            state[st_base + 2, off + 2] = np.maximum(vis[off + 1] == 4, vis[off + 3] == 4)
-            state[st_base + 2, off + 6] = np.maximum(vis[off + 5] == 4, vis[off + 7] == 4)
-            state[st_base + 2, off + 7] = vis[off + 6] == 4
-            state[st_base + 2, off + 8] = vis[off + 7] == 4
-
-        is_safe = np.clip(state[st_base] + state[st_base + 1] + state[st_base + 2], 0, 1)
-        state[st_base + 3, 0:27] = 1.0 - is_safe[0:27]
-
-        for honor in range(27, 34):
-            if vis[honor] == 0:
-                state[st_base + 4, honor] = 1.0
-
-    rw_idx = np.argmax(obs_93[78]) if np.any(obs_93[78]) else 27
-    sw_idx = np.argmax(obs_93[79]) if np.any(obs_93[79]) else 27
-
-    rw = rw_idx - 27
-    sw = sw_idx - 27
-    state[211, :] = rw / 3.0
-    state[212, :] = sw / 3.0
-
-    my_score = self_scores[p_id]
-    for i in range(4):
-        diff = (self_scores[i] - my_score) / 100000.0
-        state[216 + i, :] = diff
-
-    padded = np.pad(state, ((0, 0), (0, 2)), mode="constant")
-    return padded.reshape(256, 4, 9)
-
-
-class MultiAgentMahjongEnvWrapper:
-    """
-    【リファクタリングのコア】 半荘累計制環境ラッパー (Hanchan Cumulative Wrapper)
-    """
-
-    def __init__(self):
-        self.env = pymahjong.MahjongEnv()
-        self.shanten_calc = Shanten()  # シャンテン計算器を初期化
-        self.reset_hanchan()
-
-    def reset(self):
-        return self.reset_hanchan()
-
-    def _reset_hand_internal(self):
-        """局単位の状態のみをリセットする"""
-        self.env.reset()
-        self.current_player = self.env.get_curr_player_id()
-        self.action_history = []
-        # メトリクス抽出用の変数を初期化
-        self.last_discarder = -1
-        self.p0_min_shanten = None  # 【修正】初期向聴数はNone（起手配牌時に記録し、初期手牌深度の誤加算を防止）
-        self._pending_shanten_reduction = 0  # 【追加】未精算のシャンテン進速
-
-    def reset_hanchan(self):
-        """半荘全体をリセットし、スコアを初期化する"""
-        self.scores = np.array([25000, 25000, 25000, 25000], dtype=np.float32)
-        self.kyoku_count = 0
-        self.is_hanchan_done = False
-        self._reset_hand_internal()
-        return self._get_state_dict(), self._get_mask(), self.current_player
-
-    def step(self, action_id):
-        p = self.current_player
-        valid_actions = self.env.get_valid_actions()
-        reward = 0.0
-
-        info = {"hand_done": False, "p0_win": False, "p0_deal_in": False, "p0_riichi": False}
-
-        # 異常打ち切り保護
-        if action_id not in valid_actions:
-            if p == 0:
-                reward -= 1.0
-            return self._get_state_dict(), self._get_mask(), reward, True, p, info
-
-        # アクションインターセプトによるメトリクス記録
-        if action_id in A.DISCARD_ACTIONS:
-            self.action_history.append((p, action_id))
-            self.last_discarder = p
-
-        if action_id == A.RON:
-            if p == 0:
-                info["p0_win"] = True
-            elif self.last_discarder == 0 and p != 0:
-                info["p0_deal_in"] = True
-        elif action_id == A.TSUMO and p == 0:
-            info["p0_win"] = True
-        elif action_id == A.RIICHI and p == 0:
-            # 【修正】以前は action_id == 46 (= MINKAN) を立直と誤認して報酬を与えていた。
-            # 立直は A.RIICHI (=48)。なお無条件の立直ボーナス自体も濫立直を誘発するため撤去済み
-            # (阶段5 の報酬再設計を参照)。ここではメトリクス記録のみ行う。
-            info["p0_riichi"] = True
-
-        self.env.step(p, action_id)
-        hand_done = self.env.is_over()
-        info["hand_done"] = hand_done
-
-        if hand_done:
-            payoffs = self.env.get_payoffs()
-            for i in range(4):
-                self.scores[i] += float(payoffs[i])
-            self.kyoku_count += 1
-
-            # 【修正】毎局の即時素点報酬 (Per-Hand Payoff Reward): 局終了時の点数変動を即座に報酬化
-            hand_payoff_reward = float(payoffs[0]) / 10000.0
-            reward += hand_payoff_reward
-
-            # 【コアロジック】真の半荘終了を判定: 8局打ち終えたか、または点数が0未満のプレイヤー（ハコ割れ/飛び）がいる場合
-            if self.kyoku_count >= 8 or np.any(self.scores < 0):
-                self.is_hanchan_done = True
-
-                # 半荘終了時に順位ボーナス（ウマ）を追加精算する
-                my_score = self.scores[0]
-                rank = sum(1 for x in self.scores if x > my_score)
-
-                # 【优化】加重吃四惩罚，强化避四本能 (原为 [1.0, 0.2, -0.3, -0.9])
-                rank_bonuses = [1.2, 0.3, -0.1, -1.8]
-                bonus = rank_bonuses[min(rank, 3)]
-
-                reward += bonus
-                self.current_player = p
-            else:
-                self.is_hanchan_done = False
-                self._reset_hand_internal()
-        else:
-            self.current_player = self.env.get_curr_player_id()
-
-        return self._get_state_dict(), self._get_mask(), reward, self.is_hanchan_done, self.current_player, info
-
-    def _get_state_dict(self):
-        if self.env.is_over():
-            return {
-                "state_2d": np.zeros((256, 4, 9), dtype=np.float32),
-                "cond_vec": np.zeros(16, dtype=np.float32),
-                "seq_hist": np.full(72, 272, dtype=np.int64),
-            }
-
-        p = self.current_player
-        obs_93 = self.env.get_obs(p)
-
-        # 【修正】シャンテン計算。チート防止メカニズムを回避するため、現在の行動プレイヤーのターンでのみ計算する。
-        if p == 0:
-            # 特徴行列の0から3のインデックスを合算し、34種の牌の枚数を復元する
-            tiles34 = (obs_93[0] + obs_93[1] + obs_93[2] + obs_93[3]).astype(np.int32)
-            hand_len = int(tiles34.sum())
-            is_menzen = hand_len in [13, 14]
-            try:
-                current_shanten = self.shanten_calc.calculate_shanten(
-                    tiles34, use_chiitoitsu=is_menzen, use_kokushi=is_menzen
-                )
-                if self.p0_min_shanten is None:
-                    self.p0_min_shanten = current_shanten
-                elif current_shanten < self.p0_min_shanten:
-                    self._pending_shanten_reduction += self.p0_min_shanten - current_shanten
-                    self.p0_min_shanten = current_shanten
-            except ValueError:
-                # 【追加】C++ コアが一時的な中間状態（牌数が12など、ルール上あり得ない枚数）
-                # を返した場合は、安全にスキップしてクラッシュを防ぐ (Skip invalid transient states)
-                pass
-
-        state_2d = decode_obs_93_to_256(obs_93, self.scores, p)
-
-        cond_vec = np.zeros(16, dtype=np.float32)
-        rw_idx = np.argmax(obs_93[78]) if np.any(obs_93[78]) else 27
-        sw_idx = np.argmax(obs_93[79]) if np.any(obs_93[79]) else 27
-
-        rw = rw_idx - 27
-        sw = sw_idx - 27
-        cond_vec[4 + rw] = 1.0
-        cond_vec[8 + sw] = 1.0
-        for i in range(4):
-            rel_idx = (p + i) % 4
-            cond_vec[i] = (self.scores[rel_idx] - 25000) / 10000.0
-
-        seq_hist = np.full(72, 272, dtype=np.int64)
-        if hasattr(self, "action_history"):
-            recent_history = self.action_history[-72:]
-            for idx, (actor_id, tile_id) in enumerate(recent_history):
-                # 【修正】赤宝牌（34, 35, 36）を普通の5（4, 13, 22）にマッピングし、序列履歴でのパディング化（失明）を防ぐ
-                if tile_id == 34:
-                    tile_id = 4
-                elif tile_id == 35:
-                    tile_id = 13
-                elif tile_id == 36:
-                    tile_id = 22
-
-                rel_p = (actor_id - p) % 4
-                token = int(tile_id) * 8 + rel_p * 2 + 1
-                seq_hist[idx] = min(token, 272)
-
-        return {"state_2d": state_2d, "cond_vec": cond_vec, "seq_hist": seq_hist}
-
-    def _get_mask(self):
-        mask = np.zeros(54, dtype=np.float32)
-        if not self.env.is_over():
-            valid_actions = self.env.get_valid_actions()
-            for act in valid_actions:
-                if act < 54:
-                    mask[act] = 1.0
-        return mask
-
-
-# ==========================================
 # 4. 独立SL凍結評価モジュール (Independent SL Eval)
 # ==========================================
 def evaluation_worker(worker_id, rl_sd, sl_sd, num_hanchan, result_queue):
@@ -732,8 +549,13 @@ def sync_params(src_model, dst_model):
         dst_p.data.copy_(src_p.data)
 
 
-def async_environment_worker(worker_id, request_queue, response_pipe, trajectory_queue, steps_to_collect, shared_phase):
+def async_environment_worker(
+    worker_id, request_queue, response_pipe, trajectory_queue, steps_to_collect, shared_phase,
+    reward_config=None,
+):
     env = MultiAgentMahjongEnvWrapper()
+    reward_config = reward_config or RewardConfig()
+    decomposition = RewardDecomposition()
 
     state_dict, mask, current_player = env.reset()
     pending_transition = None
@@ -763,10 +585,12 @@ def async_environment_worker(worker_id, request_queue, response_pipe, trajectory
             log_prob_val = response["log_prob"]
             value_val = response["value"]
 
-            # [修正] アクション実行「前」に、前回の打牌以降に発生した向聴進速を抽出し、前回の pending_transition に還元する（Credit Assignment Fix）
+            # [修正] アクション実行「前」に、前回の打牌以降に発生した向聴進速を抽出し、
+            # 前回の pending_transition に還元する (Credit Assignment Fix)
             current_phase = shared_phase.value
-            shaping_weight = 0.02 if current_phase == 1 else (0.005 if current_phase == 2 else 0.0)
-            shaping_reward = env._pending_shanten_reduction * shaping_weight
+            shaping_reward = decomposition.add(
+                "shanten", env._pending_shanten_reduction * reward_config.shanten_scale(current_phase)
+            )
 
             if pending_transition is not None:
                 accumulated_reward += shaping_reward
@@ -783,31 +607,14 @@ def async_environment_worker(worker_id, request_queue, response_pipe, trajectory
             accumulated_reward = 0.0
             env._pending_shanten_reduction = 0
 
-            # [追加] 受入(Ukeire)の即時報酬
-            if action_val < 34:
+            # [修正] 受入れ (Ukeire) シェーピング。旧実装は phase ゲートが無く、
+            # 「純粋 RL」であるはずの Phase 3 でも効き続けていた。
+            ukeire_scale = reward_config.ukeire_scale(current_phase)
+            if ukeire_scale and action_val < 34:
                 obs_93 = env.env.get_obs(0)
-                tiles34 = (obs_93[0] + obs_93[1] + obs_93[2] + obs_93[3]).astype(np.int32)
-                if tiles34[action_val] > 0:
-                    tiles34[action_val] -= 1
-                    is_menzen = int(tiles34.sum()) in [13, 14]
-                    try:
-                        base_shanten = env.shanten_calc.calculate_shanten(tiles34, use_chiitoitsu=is_menzen, use_kokushi=is_menzen)
-                        ukeire_count = 0
-                        for i in range(34):
-                            if tiles34[i] < 4:
-                                tiles34[i] += 1
-                                try:
-                                    new_s = env.shanten_calc.calculate_shanten(tiles34, use_chiitoitsu=is_menzen, use_kokushi=is_menzen)
-                                    if new_s < base_shanten:
-                                        ukeire_count += (5 - tiles34[i])
-                                except ValueError:
-                                    pass
-                                tiles34[i] -= 1
-
-                        # 有効牌が1枚増えるごとに +0.0005 の報酬
-                        accumulated_reward += ukeire_count * 0.0005
-                    except ValueError:
-                        pass
+                tiles34 = obs_93[0:4].sum(axis=0).astype(np.int32)
+                count = ukeire_count(env.shanten_calc, tiles34, action_val)
+                accumulated_reward += decomposition.add("ukeire", count * ukeire_scale)
 
             pending_transition = {
                 "worker_id": worker_id,
@@ -820,7 +627,18 @@ def async_environment_worker(worker_id, request_queue, response_pipe, trajectory
                 "value": value_val,
             }
 
-        next_state_dict, next_mask, step_reward, done, next_player, info = env.step(action_val)
+        next_state_dict, next_mask, _env_reward, done, next_player, info = env.step(action_val)
+
+        # 【変更】報酬の計算は環境から reward.py へ移した。
+        # 環境は「何が起きたか」だけを返し、それをどう評価するかはここで一元管理する。
+        step_reward = 0.0
+        if info["hand_done"]:
+            step_reward += decomposition.add(
+                "payoff", info["hand_payoff_p0"] * reward_config.hand_payoff_scale
+            )
+        if done and "final_scores" in info:
+            bonus, _rank = hanchan_rank_bonus(reward_config, info["final_scores"])
+            step_reward += decomposition.add("rank", bonus)
 
         if info["p0_win"]:
             local_metrics["win_count"] += 1
@@ -838,11 +656,13 @@ def async_environment_worker(worker_id, request_queue, response_pipe, trajectory
                 pending_transition["done"] = True
                 pending_transition["next_value"] = 0.0  # 終端状態の価値は 0
                 pending_transition["metrics"] = local_metrics.copy()  # 半荘完了時にメトリクスを送信
+                pending_transition["reward_parts"] = decomposition.snapshot()
                 trajectory_queue.put(pending_transition)
 
             accumulated_reward = 0.0
             pending_transition = None
             local_metrics = {"hand_count": 0, "win_count": 0, "deal_in_count": 0, "shanten_reduction": 0}
+            decomposition.reset()
             next_state_dict, next_mask, next_player = env.reset()
 
         state_dict, mask, current_player = next_state_dict, next_mask, next_player
@@ -919,7 +739,9 @@ class PPOKLPenaltyTrainer:
         self.kl_beta = kl_beta
         self.clip_eps = 0.2
         self.ppo_epochs = ppo_epochs
-        self.gamma = 0.99
+        # 【修正】0.99 では p0 の 1 半荘 150+ ステップに対して 0.99^150 ≈ 0.22 まで減衰し、
+        # 順位ボーナスが序盤にほとんど伝わらなかった。終局の順位が目的関数なので 1.0 に近づける。
+        self.gamma = 1.0
         self.gae_lambda = 0.95
         self.buffer = PPOBuffer(num_workers)
         self.hero_buffer = HeroReplayBuffer(max_size=10000)
@@ -990,7 +812,13 @@ class PPOKLPenaltyTrainer:
                         all_s_2d[i], all_c_vec[i], all_seq_h[i], all_actions[i], all_masks[i]
                     )
 
-        self.model.train()
+        # 【修正】更新も eval モードで行う。
+        # このネットワークは 18 個の Dropout2d(p=0.30) を持つため、更新時だけ train() にすると
+        # サンプリング時の方策と更新時の方策が別物になり、PPO の重要度比が
+        # 第0エポックから 1.0 にならない (実測 ratio ≈ 100)。
+        # eval() は Dropout と BatchNorm の挙動を変えるだけで勾配は普通に流れる。
+        # BatchNorm の移動統計も SL 由来のものを保ち、自己対局のミニバッチで汚さない。
+        self.model.eval()
 
         s_2d = torch.tensor(np.array(all_s_2d), dtype=torch.float32, device=self.device)
         c_vec = torch.tensor(np.array(all_c_vec), dtype=torch.float32, device=self.device)
@@ -1034,7 +862,7 @@ class PPOKLPenaltyTrainer:
 
                 p_out, v_score, aux_t, aux_d, aux_w = self.model(mb_s_2d, mb_c_vec, mb_seq_h, rl_mode=True)
                 new_values = v_score.squeeze(-1)
-                p_out_masked = p_out + (1.0 - mb_masks) * -1e9
+                log_probs_all, p_out_masked = masked_log_probs(p_out, mb_masks)
                 new_probs = F.softmax(p_out_masked, dim=-1)
 
                 with torch.no_grad():
@@ -1052,7 +880,6 @@ class PPOKLPenaltyTrainer:
                     sl_d_target = torch.sigmoid(sl_d)
                     sl_w_target = torch.sigmoid(sl_w)
 
-                log_probs_all = torch.log(new_probs + 1e-8)
                 new_log_probs = (log_probs_all * mb_one_hot_actions).sum(dim=-1)
                 entropy = -(new_probs * log_probs_all).sum(dim=-1).mean()
 
@@ -1141,6 +968,22 @@ if __name__ == "__main__":
 
     NUM_WORKERS = 30
     STEPS_PER_WORKER = 256
+
+    # --- 学習制御のしきい値 (旧: 関数内に直書き) ---------------------------
+    # プラトー判定は「直近 N 回の評価順位の回帰直線」で行う。
+    PLATEAU_WINDOW = 5
+    PLATEAU_SLOPE_MAX = 0.02  # 順位の傾き (1 評価あたりの改善量)
+    PLATEAU_RESID_MAX = 0.06  # 回帰残差の標準偏差
+    # 昇格の黄金指標。RANK_TARGET を切れば無条件、そうでなければ素点条件つき
+    RANK_TARGET = 2.40
+    RANK_TARGET_SOFT = 2.45
+    NET_TARGET_SOFT = -1200.0
+    PHASE2_WIN_RATE_MIN = 0.05  # 流局聴牌罰符だけで昇格するのを防ぐ
+    EVAL_INTERVAL = 500
+    EVAL_HANCHAN = 2500
+
+    reward_config = RewardConfig()
+    print(f" -> [Reward] 報酬設定: {reward_config.as_dict()}")
     TARGET_BUFFER_SIZE = NUM_WORKERS * STEPS_PER_WORKER
 
     if torch_directml.is_available():
@@ -1159,8 +1002,12 @@ if __name__ == "__main__":
     REPAIR_HEAD = os.environ.get("MJ_REPAIR_HEAD", "1") == "1"
     CALL_LOGIT_PENALTY = float(os.environ.get("MJ_CALL_PENALTY", DEFAULT_CALL_LOGIT_PENALTY))
 
+    loaded_payloads: dict[str, object] = {}
+
     def load_policy(path, repair=REPAIR_HEAD):
-        sd = adapt_policy_state_dict(torch.load(path, map_location="cpu", weights_only=False))
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        loaded_payloads[path] = payload
+        sd = adapt_policy_state_dict(extract_model_state(payload))
         if repair:
             sd = repair_policy_head(sd, call_logit_penalty=CALL_LOGIT_PENALTY)
         return sd
@@ -1249,7 +1096,10 @@ if __name__ == "__main__":
     for i in range(NUM_WORKERS):
         proc = mp.Process(
             target=async_environment_worker,
-            args=(i, request_queue, child_pipes[i], trajectory_queue, STEPS_PER_WORKER, shared_phase)
+            args=(
+                i, request_queue, child_pipes[i], trajectory_queue, STEPS_PER_WORKER,
+                shared_phase, reward_config,
+            ),
         )
         proc.start()
         workers.append(proc)
@@ -1266,12 +1116,29 @@ if __name__ == "__main__":
 
     it = 0
     if resume_path:
-        match = re.search(r"_iter(\d+)\.pth", resume_path)
-        if match:
-            it = int(match.group(1))
-            print(f" -> [Info] イテレーションカウントの復元: 第 {it} イテレーションから学習を再開します")
+        restored_it = restore_training_state(loaded_payloads.get(resume_path), trainer)
+        if restored_it is not None:
+            it = int(restored_it)
+            print(
+                f" -> [Info] 学習状態を復元しました (optimizer / kl_beta / RNG)。"
+                f"第 {it} イテレーションから再開します"
+            )
+        else:
+            match = re.search(r"_iter(\d+)\.pth", resume_path)
+            if match:
+                it = int(match.group(1))
+                print(f" -> [Info] イテレーションカウントの復元: 第 {it} イテレーションから学習を再開します")
+            else:
+                print(
+                    " -> [Warn] 旧形式のチェックポイントです。イテレーション番号が復元できないため、"
+                    "ログの切り詰めをスキップします"
+                )
+                it = -1
 
-    logger.truncate_after(it)
+    if it >= 0:
+        logger.truncate_after(it)
+    else:
+        it = 0
 
     try:
         while True:
@@ -1281,6 +1148,8 @@ if __name__ == "__main__":
 
             # [追加] 日常追跡指標
             total_hands, total_wins, total_deal_ins, total_shanten_reduction = 0, 0, 0, 0
+            reward_parts_sum = dict.fromkeys(COMPONENTS, 0.0)
+            finished_hanchan = 0
 
             import queue
 
@@ -1302,6 +1171,9 @@ if __name__ == "__main__":
                         total_wins += m["win_count"]
                         total_deal_ins += m["deal_in_count"]
                         total_shanten_reduction += m["shanten_reduction"]
+                        finished_hanchan += 1
+                        for name, value in step_data.get("reward_parts", {}).items():
+                            reward_parts_sum[name] = reward_parts_sum.get(name, 0.0) + value
 
                     if added_steps >= TARGET_BUFFER_SIZE:
                         break
@@ -1334,11 +1206,12 @@ if __name__ == "__main__":
                     # GPUフォワードパス
                     with torch.no_grad():
                         p_out, v_score, _, _, _ = trainer.model(b_s2d, b_cvec, b_seqh, rl_mode=True)
-                        masked_logits = p_out + (1.0 - b_mask) * -1e9
-                        probs = F.softmax(masked_logits, dim=-1)
-                        dist = torch.distributions.Categorical(probs)
-                        actions = dist.sample()
-                        log_probs = dist.log_prob(actions)
+                        # 【重大な修正】torch.distributions.Categorical は DirectML 上で
+                        # マスクした非合法アクションを返すことがある (log_prob が
+                        # log(float32 eps) = -15.94 に張り付く)。その結果ロールアウトの
+                        # 行動は方策からのサンプルではなくなり、PPO の重要度比は
+                        # 第0エポックからクリップ上限に飽和していた。
+                        actions, log_probs = directml_safe_masked_sample(p_out, b_mask)
 
                     actions_np = actions.cpu().numpy()
                     v_score_np = v_score.squeeze(-1).cpu().numpy()
@@ -1386,18 +1259,25 @@ if __name__ == "__main__":
                     f"⚠️ [Sanity] 第0エポックの重要度比が {trainer.last_first_epoch_ratio:.4f} です "
                     "(期待値 1.00±0.02)。サンプリングと更新で状態表現か train/eval モードが食い違っています。"
                 )
+            per_hanchan = max(1, finished_hanchan)
+            parts = {k: v / per_hanchan for k, v in reward_parts_sum.items()}
+            print(
+                "   [Reward] " + "  ".join(f"{k}={v:+.4f}" for k, v in parts.items())
+                + f"  (半荘 {finished_hanchan} 局分の平均)"
+            )
             logger.log_train(
-                it, current_phase, ppo_loss, avg_reward, avg_entropy, win_rate, deal_in_rate, mean_shanten_red
+                it, current_phase, ppo_loss, avg_reward, avg_entropy, win_rate,
+                deal_in_rate, mean_shanten_red, parts,
             )
 
             # ==========================================
             # 評価とフェーズ移行ロジック
             # ==========================================
-            if it % 500 == 0:
+            if it % EVAL_INTERVAL == 0:
                 print(f"\n--- [Eval] Iter {it}: 500輪定期評価を実行します ---")
 
                 avg_rank, avg_net, win_r, deal_r = parallel_evaluate_against_sl(
-                    trainer.model, sl_base_model, total_hanchan=2500, num_eval_workers=10
+                    trainer.model, sl_base_model, total_hanchan=EVAL_HANCHAN, num_eval_workers=10
                 )
 
                 eval_rank_history.append(avg_rank)
@@ -1411,27 +1291,40 @@ if __name__ == "__main__":
                     best_eval_rank = avg_rank
                     best_eval_net = avg_net
                     true_best_path = f"smart_mahjong_ppo_TRUE_BEST_phase{current_phase}.pth"
-                    ckpt_manager.safe_save(trainer.model.state_dict(), true_best_path)
+                    ckpt_manager.safe_save(
+                        build_checkpoint(
+                            trainer.model, trainer, current_phase, it, reward_config,
+                            extra={"eval": {"rank": avg_rank, "net": avg_net,
+                                            "win_rate": win_r, "deal_in_rate": deal_r}},
+                        ),
+                        true_best_path,
+                    )
                     print(
                         f"     🏆 [True Best] 対SL評価の最高記録更新！(Rank: {avg_rank:.3f}, Net: {avg_net:.1f}) -> {true_best_path}"
                     )
 
                 if it >= 1000:
-                    cv_val = np.std(reward_history_window) / (abs(np.mean(reward_history_window)) + 1e-8)
+                    # 【修正】旧判定は avg_reward の変動係数 std/|mean| を使っていたが、
+                    # 自己対局では avg_reward が 0 付近を揺れるため分母が 0 に近づき、
+                    # CV が発散して「プラトー」条件がほぼ永久に成立しなかった。
+                    # 評価順位そのものの回帰直線 (傾き + 残差) で判定する。
+                    k_val, resid_std = 1.0, float("inf")
+                    if len(eval_rank_history) >= PLATEAU_WINDOW:
+                        y = np.array(eval_rank_history[-PLATEAU_WINDOW:], dtype=np.float64)
+                        x = np.arange(len(y), dtype=np.float64)
+                        k_val, b_val = np.polyfit(x, y, 1)
+                        resid_std = float(np.std(y - (k_val * x + b_val)))
 
-                    k_val = 1.0
-                    if len(eval_rank_history) >= 3:
-                        y = eval_rank_history[-3:]
-                        x = np.array([0, 1, 2])
-                        k_val, _ = np.polyfit(x, y, 1)
-
-                    # 平台期判定：CV 符合强化学习探索方差 (<0.35) 且 顺位斜率平稳 (<0.05)
-                    is_plateau = (cv_val < 0.35) and (abs(k_val) < 0.05)
+                    is_plateau = abs(k_val) < PLATEAU_SLOPE_MAX and resid_std < PLATEAU_RESID_MAX
                     # 基线超越判定：以平均顺位（Avg Rank <= 2.40）为核心黄金指标，免除微小负素点死锁
-                    exceed_sl = (avg_rank <= 2.40) or (avg_rank <= 2.45 and avg_net > -1200.0)
+                    exceed_sl = avg_rank <= RANK_TARGET or (
+                        avg_rank <= RANK_TARGET_SOFT and avg_net > NET_TARGET_SOFT
+                    )
 
                     print(
-                        f"🔍 [Plateau Check] CV: {cv_val:.4f} (Thresh: <0.35) | Slope |k|: {abs(k_val):.4f} (Thresh: <0.05) | Rank: {avg_rank:.3f} (Thresh: <=2.40)"
+                        f"🔍 [Plateau Check] 順位の傾き |k|={abs(k_val):.4f} (<{PLATEAU_SLOPE_MAX}) | "
+                        f"残差 σ={resid_std:.4f} (<{PLATEAU_RESID_MAX}) | "
+                        f"直近 {PLATEAU_WINDOW} 回評価 | Rank={avg_rank:.3f} (<={RANK_TARGET})"
                     )
 
                     if is_plateau:
@@ -1466,7 +1359,7 @@ if __name__ == "__main__":
                         elif current_phase == 2:
                             # [修正] Phase 2からPhase 3への昇格は「実際の和了」で証明する必要がある
                             # 「流局聴牌罰符 (No-Ten Bappu)」だけでポイントを稼ぎ昇格する可能性を排除。和了率 >= 5% を強制
-                            phase2_exceed = exceed_sl and (win_r >= 0.05)
+                            phase2_exceed = exceed_sl and (win_r >= PHASE2_WIN_RATE_MIN)
                             if phase2_exceed:
                                 print(
                                     f"\n🌟 [Phase Transition] Phase 2 基準達成 (Rank:{avg_rank:.3f}, WinR:{win_r:.2%})。最終段階 Phase 3 を開始します！"
@@ -1497,7 +1390,7 @@ if __name__ == "__main__":
                             # [追加] Phase 3 最終卒業条件
                             # 対戦相手は Phase 2 の卒業モデル。同レベルの対戦では Rank 2.5 が引き分け。
                             # Rank <= 2.45 かつ 純スコア > 0 を達成し、純粋なRLがUkeireヒューリスティックモデルを確実に超えたことを証明する必要がある。
-                            phase3_success = (avg_rank <= 2.45) and (avg_net > 0)
+                            phase3_success = (avg_rank <= RANK_TARGET_SOFT) and (avg_net > 0)
 
                             if phase3_success:
                                 print(
@@ -1505,7 +1398,12 @@ if __name__ == "__main__":
                                 )
                                 print(" -> 純粋な強化学習が Phase 2 ヒューリスティックモデルを成功裏に超え、AIは極致に達しました！")
                                 final_model_path = "smart_mahjong_ppo_final_phase3_MASTER.pth"
-                                ckpt_manager.safe_save(trainer.model.state_dict(), final_model_path)
+                                ckpt_manager.safe_save(
+                                    build_checkpoint(
+                                        trainer.model, trainer, current_phase, it, reward_config
+                                    ),
+                                    final_model_path,
+                                )
                                 print(f" -> 最終マスターモデルを保存しました: {final_model_path}")
                                 break
                             else:
@@ -1519,7 +1417,10 @@ if __name__ == "__main__":
 
             if it % 10 == 0:
                 ckpt_manager.save_with_rotation(
-                    trainer.model.state_dict(), "smart_mahjong_ppo_latest", current_phase, it
+                    build_checkpoint(trainer.model, trainer, current_phase, it, reward_config),
+                    "smart_mahjong_ppo_latest",
+                    current_phase,
+                    it,
                 )
 
     except KeyboardInterrupt:

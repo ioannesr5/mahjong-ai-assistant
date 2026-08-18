@@ -205,3 +205,35 @@ def directml_safe_bce_with_logits(logits, targets):
     probs = torch.sigmoid(logits)
     probs = torch.clamp(probs, 1e-7, 1.0 - 1e-7)
     return -(targets * torch.log(probs) + (1.0 - targets) * torch.log(1.0 - probs)).mean()
+
+
+def masked_log_probs(logits, mask, neg_inf=-1e9):
+    """合法手マスクを適用した log-softmax。サンプリング側と更新側で必ずこれを使う。"""
+    masked = logits + (1.0 - mask) * neg_inf
+    return torch.log(F.softmax(masked, dim=-1) + 1e-8), masked
+
+
+def directml_safe_masked_sample(logits, mask, generator=None):
+    """
+    合法手マスク付きのカテゴリカル・サンプリング (Gumbel-max 法)。
+
+    【重大な修正】torch.distributions.Categorical は DirectML バックエンドでは
+    多項サンプリングが正しく動かず、**マスクで禁止したアクションを返す**ことがある。
+    実測では返された行動の log_prob が log(1e-7) ≈ -15.94 に張り付き、
+    PPO の重要度比が第0エポックから exp(5) のクリップ上限 (≈148) に飽和していた。
+    つまりロールアウトの行動は「方策からのサンプル」になっていなかった。
+
+    Gumbel-max は elementwise 演算と argmax だけで構成されるため DirectML でも安全。
+    マスクされた要素は -1e9 のままなので選ばれることはない。
+
+    Returns:
+        (actions, log_probs) — log_probs は更新側とまったく同じ式で計算した値
+    """
+    log_probs, _ = masked_log_probs(logits, mask)
+    # 乱数は CPU で作って転送する (デバイス側 RNG の実装差を避けるため)
+    uniform = torch.rand(log_probs.shape, generator=generator, device="cpu")
+    uniform = uniform.clamp_(1e-20, 1.0).to(log_probs.device)
+    gumbel = -torch.log(-torch.log(uniform))
+    actions = torch.argmax(log_probs + gumbel, dim=-1)
+    chosen = log_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
+    return actions, chosen
