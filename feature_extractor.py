@@ -7,58 +7,96 @@ import numpy as np
 # 0..8: マンズ(1m-9m), 9..17: ピンズ(1p-9p), 18..26: ソーズ(1s-9s), 27..33: 字牌(東南西北白發中)
 # 空間テンソル(4x9)への変換を見据え、字牌の末尾(34, 35)はパディングとして扱います。
 # ==============================================================================
+# MJAI 牌表記 -> 牌ID (0..33)
+#   数牌: "1m".."9m" / "1p".."9p" / "1s".."9s"
+#   字牌: "E"(東) "S"(南) "W"(西) "N"(北) "P"(白) "F"(發) "C"(中)
+#   赤ドラ: "5mr" / "5pr" / "5sr" (天鳳形式の "0m"/"0p"/"0s" も受け付ける)
+#
+# 【重大な修正】以前はこの表が "1z".."7z" しか持っておらず、実際の牌譜が使う
+# "E"/"S"/"W"/"N"/"P"/"F"/"C" は dict.get(..., 0) の既定値に落ちて **全て 1m (ID 0)**
+# として解析されていた。字牌は全打牌の約 3 割を占めるため、
+# 打牌ラベル・可視枚数・現物/筋/壁・待ち牌ラベル・系列トークンの全てが汚染されていた。
 TILE_STR_TO_ID = {
-    "1m": 0,
-    "2m": 1,
-    "3m": 2,
-    "4m": 3,
-    "5m": 4,
-    "6m": 5,
-    "7m": 6,
-    "8m": 7,
-    "9m": 8,
-    "1p": 9,
-    "2p": 10,
-    "3p": 11,
-    "4p": 12,
-    "5p": 13,
-    "6p": 14,
-    "7p": 15,
-    "8p": 16,
-    "9p": 17,
-    "1s": 18,
-    "2s": 19,
-    "3s": 20,
-    "4s": 21,
-    "5s": 22,
-    "6s": 23,
-    "7s": 24,
-    "8s": 25,
-    "9s": 26,
-    "1z": 27,
-    "2z": 28,
-    "3z": 29,
-    "4z": 30,
-    "5z": 31,
-    "6z": 32,
-    "7z": 33,
+    **{f"{n}m": n - 1 for n in range(1, 10)},
+    **{f"{n}p": 8 + n for n in range(1, 10)},
+    **{f"{n}s": 17 + n for n in range(1, 10)},
+    "E": 27,  # 東
+    "S": 28,  # 南
+    "W": 29,  # 西
+    "N": 30,  # 北
+    "P": 31,  # 白
+    "F": 32,  # 發
+    "C": 33,  # 中
+    # 別表記の互換 (一部のコンバータは "1z".."7z" を出力する)
+    **{f"{n}z": 26 + n for n in range(1, 8)},
+}
+
+# 赤ドラ表記 -> (牌ID, 赤フラグ)
+RED_TILE_STR_TO_ID = {
+    "0m": 4,
+    "5mr": 4,
+    "0p": 13,
+    "5pr": 13,
+    "0s": 22,
+    "5sr": 22,
 }
 
 
-def parse_tile(tile_str: str) -> tuple[int, bool]:
+class UnknownTileError(ValueError):
+    """牌譜に未知の牌表記が現れた場合に送出する (黙って 1m に落とさないため)"""
+
+
+def parse_tile(tile_str: str, strict: bool = True) -> tuple[int, bool]:
     """
-    牌文字列（例: "5m", "5mr" / 赤ドラ）を牌ID(0..33)と赤ドラフラグに変換する。
-    （将牌字符串解析为牌 ID 与赤宝牌标志）
+    牌文字列を (牌ID 0..33, 赤ドラフラグ) に変換する。
+
+    strict=True の場合、未知の表記は UnknownTileError を送出する。
+    以前は不明な表記を黙って 0 (=1m) にフォールバックしており、
+    字牌が全て 1m として学習される原因になっていた。
     """
-    is_red = False
-    if tile_str in ["0m", "5mr"]:
-        return 4, True
-    elif tile_str in ["0p", "5pr"]:
-        return 13, True
-    elif tile_str in ["0s", "5sr"]:
-        return 22, True
-    clean_str = tile_str.replace("r", "")
-    return TILE_STR_TO_ID.get(clean_str, 0), is_red
+    if tile_str in RED_TILE_STR_TO_ID:
+        return RED_TILE_STR_TO_ID[tile_str], True
+    tile_id = TILE_STR_TO_ID.get(tile_str)
+    if tile_id is None:
+        if strict:
+            raise UnknownTileError(f"未知の牌表記です: {tile_str!r}")
+        return 0, False
+    return tile_id, False
+
+
+# ==============================================================================
+# 捨て牌系列トークンの唯一の仕様 (Single spec for the discard-sequence tokens)
+#   token = tile_id * 8 + rel_actor * 2 + cut_type
+#     tile_id  : 0..33
+#     rel_actor: (打牌者 - 自分) % 4        0..3
+#     cut_type : 1 = 手切り, 0 = ツモ切り
+#   最大値 = 33*8 + 3*2 + 1 = 271、PAD = 272 (Embedding の padding_idx)
+#
+# 【重大な修正】従来は 3 箇所で別々の符号化が行われていた:
+#   - SL 打牌サンプル: rel_actor が常に 0、cut_type が「現在の一手」の値を系列全体に適用
+#   - SL 鳴きサンプル: tile_id*8 のみ (別の符号化)
+#   - RL 側        : cut_type が常に 1、しかも直近 72 手 (SL は最古の 72 手)
+# 3 つの符号化が同じ Embedding テーブルを共有していたため、系列表現は無意味だった。
+SEQ_PAD_TOKEN = 272
+SEQ_VOCAB_SIZE = 273
+
+
+def encode_discard_token(tile_id: int, rel_actor: int, is_tsumogiri: bool) -> int:
+    return int(tile_id) * 8 + int(rel_actor) * 2 + (0 if is_tsumogiri else 1)
+
+
+def encode_discard_sequence(discard_events, self_seat: int, max_len: int = 72) -> np.ndarray:
+    """
+    捨て牌イベント列 [(actor, tile_str, is_tsumogiri), ...] を系列トークンに変換する。
+    直近 max_len 手を、古い順に左詰めで格納する。
+    """
+    seq = np.full(max_len, SEQ_PAD_TOKEN, dtype=np.int64)
+    recent = discard_events[-max_len:]
+    for idx, (actor, tile_str, is_tsumogiri) in enumerate(recent):
+        tile_id, _ = parse_tile(tile_str)
+        rel_actor = (actor - self_seat) % 4
+        seq[idx] = encode_discard_token(tile_id, rel_actor, is_tsumogiri)
+    return seq
 
 
 @dataclass
@@ -73,6 +111,12 @@ class PlayerState:
     riichi_turn: int = -1
 
 
+# 決定タイプ (チャネル 223 / seq とは別に、どの種類の判断を求められているかを明示する)
+DECISION_DISCARD = 0  # 打牌選択
+DECISION_RESPONSE = 1  # 他家の打牌に対する鳴き/ロン応答
+DECISION_RIICHI = 2  # 立直宣言するか否か
+
+
 @dataclass
 class MahjongGameState:
     self_seat: int
@@ -85,7 +129,17 @@ class MahjongGameState:
     kyotaku: int = 0
     tiles_left: int = 70
     is_all_last: bool = False
-    global_discards: list[str] = field(default_factory=list)
+
+    # 捨て牌イベント列 (actor, 牌文字列, ツモ切りか)。seq_hist トークンの生成に使う。
+    discard_events: list[tuple[int, str, bool]] = field(default_factory=list)
+
+    # --- 決定コンテキスト (チャネル 221~224) ---
+    # 従来これらの情報はテンソルに一切入っていなかったため、
+    # 「どの牌を鳴くか」を問われても対象牌が分からず、鳴き判断が原理的に学習不能だった。
+    decision_type: int = DECISION_DISCARD
+    last_action_tile: str | None = None  # 直前に打たれた/鳴き対象の牌
+    last_action_actor: int | None = None  # その牌を打ったプレイヤー (絶対座席)
+    drawn_tile: str | None = None  # 自分がいまツモった牌
 
 
 class MahjongFeatureExtractor256:
@@ -323,6 +377,27 @@ class MahjongFeatureExtractor256:
 
         tensor_1d[220, :] = 1.0 if game_state.is_all_last else 0.0
 
+        # =========================================================
+        # チャンネル 221~224: [決定コンテキスト (Decision Context)]
+        # 従来 221~255 は未使用の予約領域だった。ネットワークの入力形状は変えずに、
+        # 「いま何を判断しているのか」「対象牌は何か」を明示する。
+        # 221: 対象牌 (直前の打牌 / 鳴き対象牌) の one-hot
+        # 222: その打牌者の相対座席 ((rel+1)/4 をブロードキャスト、0 は該当なし)
+        # 223: 決定タイプ (0=打牌 / 1=応答 / 2=立直宣言 を /2 でブロードキャスト)
+        # 224: 自分のツモ牌 one-hot
+        # =========================================================
+        if game_state.last_action_tile is not None:
+            last_id, _ = parse_tile(game_state.last_action_tile)
+            tensor_1d[221, last_id] = 1.0
+        if game_state.last_action_actor is not None:
+            rel_actor = (game_state.last_action_actor - game_state.self_seat) % 4
+            # 0 は「該当なし」を表すため 1 起点で符号化する ((rel+1)/4 ∈ {0.25, 0.5, 0.75, 1.0})
+            tensor_1d[222, :] = (rel_actor + 1) / 4.0
+        tensor_1d[223, :] = game_state.decision_type / 2.0
+        if game_state.drawn_tile is not None:
+            drawn_id, _ = parse_tile(game_state.drawn_tile)
+            tensor_1d[224, drawn_id] = 1.0
+
         # --- 2D空間へのトランスフォーム (Transform to 256x4x9 Spatial Tensor) ---
         padded_tensor = np.pad(tensor_1d, ((0, 0), (0, 2)), mode="constant", constant_values=0)
         state_2d = padded_tensor.reshape((self.num_channels, 4, 9))
@@ -341,10 +416,8 @@ class MahjongFeatureExtractor256:
         cond_vec[14] = game_state.tiles_left / 70.0
         cond_vec[15] = 1.0 if game_state.is_all_last else 0.0
 
-        seq_hist = np.full(self.seq_max_len, self.pad_id, dtype=np.int64)
-        actual_len = min(len(game_state.global_discards), self.seq_max_len)
-        for i in range(actual_len):
-            tile_id, _ = parse_tile(game_state.global_discards[i])
-            seq_hist[i] = tile_id
+        seq_hist = encode_discard_sequence(
+            game_state.discard_events, game_state.self_seat, self.seq_max_len
+        )
 
         return {"state_2d": state_2d, "cond_vec": cond_vec, "seq_hist": seq_hist}

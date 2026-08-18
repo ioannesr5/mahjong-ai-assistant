@@ -20,7 +20,8 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 # rl_ppo_trainer.py の __main__ ブロックを実行せずにモジュールとして読み込む
-_src = open("rl_ppo_trainer.py", encoding="utf-8").read().split('if __name__ == "__main__":')[0]
+with open("rl_ppo_trainer.py", encoding="utf-8") as _f:
+    _src = _f.read().split('if __name__ == "__main__":')[0]
 rl = types.ModuleType("rl")
 rl.__dict__["__name__"] = "rl"
 exec(compile(_src, "rl_ppo_trainer.py", "exec"), rl.__dict__)

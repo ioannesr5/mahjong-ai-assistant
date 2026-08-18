@@ -18,6 +18,8 @@ from torch import nn
 from torch.optim.optimizer import Optimizer
 from tqdm import tqdm
 
+import actions as A
+
 
 class TrainingLogger:
     """
@@ -62,7 +64,7 @@ class TrainingLogger:
                 continue
             try:
                 valid_rows = []
-                with open(path, "r", newline="", encoding="utf-8") as f:
+                with open(path, newline="", encoding="utf-8") as f:
                     reader = csv.reader(f)
                     file_header = next(reader, None)
                     if file_header:
@@ -322,10 +324,13 @@ class SmartMahjongMultiTaskNet(nn.Module):
         return p_out, v_head, aux_t, aux_d, aux_w
 
 
-def adapt_policy_state_dict(sd, target_actions=54):
+def adapt_policy_state_dict(sd, target_actions=A.N_ACTIONS):
     """
-    47次元の旧チェックポイント重みを54次元の完全アクション空間に安全に適応・変換する
-    (Safely adapts 47-dim legacy checkpoints to 54-dim full action space)
+    旧47次元チェックポイントの重みを54次元アクション空間へ移行する。
+
+    写像は actions.LEGACY47_TO_54 (= observation_action_explanation.pdf Table 5) が唯一の根拠。
+    旧空間に対応物が無い新アクション (赤ドラ打牌・チー/ポン/カンの赤変種) は、
+    意味的に最も近い旧アクションの重みで初期化する。
     """
     if "policy_out.weight" not in sd:
         return sd
@@ -333,63 +338,170 @@ def adapt_policy_state_dict(sd, target_actions=54):
     b = sd["policy_out.bias"]
     if w.shape[0] == target_actions:
         return sd
-    if w.shape[0] == 47 and target_actions == 54:
-        new_w = torch.zeros((54, w.shape[1]), dtype=w.dtype)
-        new_b = torch.zeros(54, dtype=b.dtype)
+    if w.shape[0] != A.Legacy47.N_ACTIONS or target_actions != A.N_ACTIONS:
+        raise ValueError(
+            f"未知のアクション次元です: checkpoint={w.shape[0]}, target={target_actions}"
+        )
 
-        # 0..33: 通常打牌 (0..33)
-        new_w[0:34] = w[0:34]
-        new_b[0:34] = b[0:34]
+    L = A.Legacy47
+    new_w = torch.zeros((A.N_ACTIONS, w.shape[1]), dtype=w.dtype)
+    new_b = torch.zeros(A.N_ACTIONS, dtype=b.dtype)
 
-        # 34..36: 赤宝牌打牌 (5m=4, 5p=13, 5s=22)
-        new_w[34] = w[4]
-        new_b[34] = b[4]
-        new_w[35] = w[13]
-        new_b[35] = b[13]
-        new_w[36] = w[22]
-        new_b[36] = b[22]
+    # 1) 旧空間に厳密な対応があるもの (打牌 0..33 / チー3種 / ポン / カン3種 / 立直 / ロン / ツモ / 九種 / パス2種)
+    for legacy_id, new_id in A.LEGACY47_TO_54.items():
+        new_w[new_id] = w[legacy_id]
+        new_b[new_id] = b[legacy_id]
 
-        # 37..42: チー (CHI, SLインデックス=34)
-        for i in range(37, 43):
-            new_w[i] = w[34]
-            new_b[i] = b[34]
+    # 2) 赤ドラ打牌 (34..36) <- 対応する通常5の打牌
+    for tile_id, red_action in A.RED_DISCARD_OF_TILE.items():
+        new_w[red_action] = w[tile_id]
+        new_b[red_action] = b[tile_id]
 
-        # 43..44: ポン (PON, SLインデックス=37)
-        for i in range(43, 45):
-            new_w[i] = w[37]
-            new_b[i] = b[37]
+    # 3) 赤を使う鳴き変種 <- 赤を使わない同種の鳴き
+    for red_action, base_action in (
+        (A.CHI_LEFT_RED, L.CHI_SMALL),
+        (A.CHI_MIDDLE_RED, L.CHI_MIDDLE),
+        (A.CHI_RIGHT_RED, L.CHI_LARGE),
+        (A.PON_RED, L.PON),
+    ):
+        new_w[red_action] = w[base_action]
+        new_b[red_action] = b[base_action]
 
-        # 45..47: カン (KAN, SLインデックス=39)
-        for i in range(45, 48):
-            new_w[i] = w[39]
-            new_b[i] = b[39]
+    sd_copy = dict(sd)
+    sd_copy["policy_out.weight"] = new_w
+    sd_copy["policy_out.bias"] = new_b
+    return sd_copy
 
-        # 48: リーチ (RIICHI, SLインデックス=41)
-        new_w[48] = w[41]
-        new_b[48] = b[41]
 
-        # 49: ロン (RON, SL和了インデックス=42)
-        new_w[49] = w[42]
-        new_b[49] = b[42]
+# --- 死んだアクションヘッドの復活 (Dead Action Head Revival) ---------------
+# 旧 SL データセットには reach / hora / pass サンプルが一切含まれていなかったため、
+# 立直・ロン・ツモ・九種・パスに対応する出力行は「初期化されたまま」学習されていない。
+# その結果「和了できる場面でパスする」「鳴ける場面で必ず鳴く」退化方策になっていた。
+# ここでそれらの行を再初期化し、麻雀の常識に沿った事前分布を与える。
+# 阶段2 で正しいラベルを持つデータセットを再構築し SL を再学習したら、この処置は不要になる。
 
-        # 50: ツモ (TSUMO, SL和了インデックス=42)
-        new_w[50] = w[42]
-        new_b[50] = b[42]
+# 「和了できるなら和了する」は大半の局面でほぼ最適なので、正のバイアスで温かく起動する。
+AGARI_WARM_START_BIAS = 2.0
+# 「門前聴牌なら立直する」も既定としては妥当 (ダマは例外)。
+RIICHI_WARM_START_BIAS = 1.0
+# 鳴きロジットへの追加補正。
+#
+# 実測メモ: 旧 SL は「鳴いた局面」しか学習しておらず、鳴き/パスの選択に有効な信号を
+# 一切持たない。そのため鳴きロジットとパスロジットの差 Δ を掃引しても応答は
+# ナイフエッジ (Δ=1.5 で 6%、Δ=1.94 で 60~79%) で、人間並みの鳴き率 (25~40%) に
+# 調整することは原理的に不可能である。
+# ここでは「鳴きすぎて門前率 0 になり和了が消える」退化だけを防げばよいので、
+# 追加補正は 0 とし、パスロジットの復活 (bias 0) による自然な抑制に任せる。
+# 本来の鳴き判断は 阶段2 の PASS 負例を含むデータセットで SL を再学習して獲得する。
+DEFAULT_CALL_LOGIT_PENALTY = 0.0
 
-        # 51: 九種九牌 (PUSH, SLパスインデックス=45)
-        new_w[51] = w[45]
-        new_b[51] = b[45]
 
-        # 52..53: リーチパス, 応答パス (PASS, SLパスインデックス=45)
-        new_w[52] = w[45]
-        new_b[52] = b[45]
-        new_w[53] = w[45]
-        new_b[53] = b[45]
+def diagnose_policy_head(sd, dead_ratio=0.5):
+    """
+    policy_out の各行の重みノルムを見て「一度も学習されていない行」を検出する。
+    打牌行 (0..33) の中央値の dead_ratio 倍を下回る行を死行とみなす。
+    """
+    w = sd["policy_out.weight"].float()
+    norms = w.norm(dim=1)
+    reference = float(norms[A.DISCARD_START : A.DISCARD_END].median())
+    threshold = reference * dead_ratio
+    dead = [i for i in range(w.shape[0]) if float(norms[i]) < threshold]
+    return dead, reference, threshold
 
-        sd_copy = dict(sd)
-        sd_copy["policy_out.weight"] = new_w
-        sd_copy["policy_out.bias"] = new_b
-        return sd_copy
+
+def repair_policy_head(sd, call_logit_penalty=DEFAULT_CALL_LOGIT_PENALTY, verbose=True):
+    """
+    死んだ出力行を復活させ、行動事前分布を注入した state_dict を返す (in-place ではない)。
+    ネットワーク構造は一切変更しない。変わるのは policy_out の重みの初期値のみ。
+
+    復活の方針:
+      * 意味的に対応する「生きている兄弟行」があればそれを複製する
+        (チー中/右 <- チー左、暗槓/加槓 <- 明槓、字牌打牌 <- 么九牌打牌の平均)
+      * 兄弟が無い宣言系 (立直/ロン/ツモ/九種/パス) は再初期化し、事前分布バイアスを与える
+
+    これは阶段2 でラベルを修正したデータセットを作り、阶段4 で SL を再学習するまでの
+    足場 (scaffolding) である。再学習後は MJ_REPAIR_HEAD=0 で無効化すること。
+    """
+    sd = dict(sd)
+    w = sd["policy_out.weight"].clone().float()
+    b = sd["policy_out.bias"].clone().float()
+
+    dead, reference, threshold = diagnose_policy_head(sd)
+    dead_set = set(dead)
+    if verbose:
+        print(f" -> [Head Repair] 打牌行の重みノルム中央値={reference:.3f} (死行判定閾値={threshold:.3f})")
+        print(f" -> [Head Repair] 検出された死行 ({len(dead)}): {[A.ACTION_NAMES[i] for i in dead]}")
+    if not dead_set:
+        if verbose:
+            print(" -> [Head Repair] 死行なし。修復をスキップします")
+        return sd
+
+    repaired = []
+
+    def clone_from(target, donors, note):
+        """donors のうち生きている行の平均を target にコピーする"""
+        alive = [d for d in donors if d not in dead_set]
+        if not alive:
+            return False
+        stacked = torch.stack([w[d] for d in alive])
+        averaged = stacked.mean(dim=0)
+        # 平均は方向が打ち消し合ってノルムが縮むので、ドナーの平均ノルムに揃え直す
+        # (揃えないとロジットのスケールが小さくなり、当該アクションが選ばれにくくなる)
+        target_norm = float(stacked.norm(dim=1).mean())
+        averaged = averaged * (target_norm / max(float(averaged.norm()), 1e-8))
+        w[target] = averaged
+        b[target] = torch.stack([b[d] for d in alive]).mean()
+        repaired.append(f"{A.ACTION_NAMES[target]}<-{note}")
+        return True
+
+    # 1) 鳴きの変種: 生きている同種の鳴きから複製する
+    #    (旧データセットは全てのチーを 1 つのラベルに潰していたため、中/右チーが死んでいる)
+    for group in (A.CHI_ACTIONS, A.PON_ACTIONS, A.KAN_ACTIONS):
+        for target in group:
+            if target in dead_set:
+                clone_from(target, list(group), "同種の鳴き")
+
+    # 2) 字牌の打牌 (27..33): 么九牌の打牌行の平均から復活させる
+    #    (parse_tile の字牌バグにより、旧データセットでは字牌打牌ラベルが 1 件も存在しなかった)
+    TERMINALS = [0, 8, 9, 17, 18, 26]
+    for target in range(27, 34):
+        if target in dead_set:
+            clone_from(target, TERMINALS, "么九牌打牌の平均")
+
+    # 3) 宣言系: 対応する兄弟が存在しないので再初期化 + 事前分布バイアス
+    dead_declarations = [i for i in A.DECLARATION_ACTIONS if i in dead_set]
+    if dead_declarations:
+        fan_in = w.shape[1]
+        std = float(w[A.DISCARD_START : A.DISCARD_END].std())
+        generator = torch.Generator().manual_seed(20260818)
+        for i in dead_declarations:
+            w[i] = torch.randn(fan_in, generator=generator) * std
+            b[i] = 0.0
+            repaired.append(f"{A.ACTION_NAMES[i]}<-再初期化")
+        # 「和了できるなら和了する」は大半の局面でほぼ最適なので温かく起動する
+        b[A.RON] = AGARI_WARM_START_BIAS
+        b[A.TSUMO] = AGARI_WARM_START_BIAS
+        b[A.RIICHI] = RIICHI_WARM_START_BIAS
+        b[A.KYUSHUKYUHAI] = -1.0  # 九種九牌が正解の局面は稀
+
+    if call_logit_penalty:
+        # 鳴きロジットを一律に押し下げる。バイアス項に畳み込むため
+        # サンプリング・更新・評価のすべてで一貫し、PPO は学習でこれを打ち消せる。
+        for i in A.CALL_ACTIONS:
+            b[i] -= call_logit_penalty
+
+    if verbose:
+        print(f" -> [Head Repair] 復活: {', '.join(repaired)}")
+        if dead_declarations:
+            print(
+                f" -> [Head Repair] RON/TSUMO に +{AGARI_WARM_START_BIAS}、"
+                f"RIICHI に +{RIICHI_WARM_START_BIAS} のウォームスタートバイアス"
+            )
+        if call_logit_penalty:
+            print(f" -> [Head Repair] 鳴き {len(A.CALL_ACTIONS)} 件に -{call_logit_penalty} のロジット補正")
+
+    sd["policy_out.weight"] = w.to(sd["policy_out.weight"].dtype)
+    sd["policy_out.bias"] = b.to(sd["policy_out.bias"].dtype)
     return sd
 
 
@@ -532,7 +644,7 @@ class MultiAgentMahjongEnvWrapper:
         valid_actions = self.env.get_valid_actions()
         reward = 0.0
 
-        info = {"hand_done": False, "p0_win": False, "p0_deal_in": False}
+        info = {"hand_done": False, "p0_win": False, "p0_deal_in": False, "p0_riichi": False}
 
         # 異常打ち切り保護
         if action_id not in valid_actions:
@@ -540,21 +652,23 @@ class MultiAgentMahjongEnvWrapper:
                 reward -= 1.0
             return self._get_state_dict(), self._get_mask(), reward, True, p, info
 
-        # アクションインターセプトによるメトリクス記録 (0..33: 通常打牌, 34..36: 赤宝牌打牌)
-        if 0 <= action_id <= 36:
+        # アクションインターセプトによるメトリクス記録
+        if action_id in A.DISCARD_ACTIONS:
             self.action_history.append((p, action_id))
             self.last_discarder = p
 
-        if action_id == 49:  # ロン (RON)
+        if action_id == A.RON:
             if p == 0:
                 info["p0_win"] = True
             elif self.last_discarder == 0 and p != 0:
                 info["p0_deal_in"] = True
-        elif action_id == 50 and p == 0:  # ツモ (TSUMO)
+        elif action_id == A.TSUMO and p == 0:
             info["p0_win"] = True
-        elif action_id == 46 and p == 0:  # 立直 (RIICHI) - Action ID 46
-            # 【优化】为立直动作提供微小的正向补偿，克服模型对 1000 点罚符的恐惧
-            reward += 0.1
+        elif action_id == A.RIICHI and p == 0:
+            # 【修正】以前は action_id == 46 (= MINKAN) を立直と誤認して報酬を与えていた。
+            # 立直は A.RIICHI (=48)。なお無条件の立直ボーナス自体も濫立直を誘発するため撤去済み
+            # (阶段5 の報酬再設計を参照)。ここではメトリクス記録のみ行う。
+            info["p0_riichi"] = True
 
         self.env.step(p, action_id)
         hand_done = self.env.is_over()
@@ -577,7 +691,7 @@ class MultiAgentMahjongEnvWrapper:
                 # 半荘終了時に順位ボーナス（ウマ）を追加精算する
                 my_score = self.scores[0]
                 rank = sum(1 for x in self.scores if x > my_score)
-                
+
                 # 【优化】加重吃四惩罚，强化避四本能 (原为 [1.0, 0.2, -0.3, -0.9])
                 rank_bonuses = [1.2, 0.3, -0.1, -1.8]
                 bonus = rank_bonuses[min(rank, 3)]
@@ -648,7 +762,7 @@ class MultiAgentMahjongEnvWrapper:
                     tile_id = 13
                 elif tile_id == 36:
                     tile_id = 22
-                
+
                 rel_p = (actor_id - p) % 4
                 token = int(tile_id) * 8 + rel_p * 2 + 1
                 seq_hist[idx] = min(token, 272)
@@ -802,7 +916,6 @@ def async_environment_worker(worker_id, request_queue, response_pipe, trajectory
     state_dict, mask, current_player = env.reset()
     pending_transition = None
     accumulated_reward = 0.0
-    sync_counter = 0
 
     # ローカルメトリクスの初期化
     local_metrics = {"hand_count": 0, "win_count": 0, "deal_in_count": 0, "shanten_reduction": 0}
@@ -810,15 +923,20 @@ def async_environment_worker(worker_id, request_queue, response_pipe, trajectory
     while True:
         request_queue.put({
             "worker_id": worker_id,
-            "state_2d": state_dict["state_2d"].astype(np.int8),  # [高速化1] 36KB -> 9KB、Pickle通信のボトルネックを完全に解消
-            "cond_vec": state_dict["cond_vec"],
+            # 【修正】以前は astype(np.int8) で量子化していたが、state_2d の
+            # チャネル 211/212 (風) と 216-219 (点差) は |値| < 1 の小数のため
+            # 全て 0 に潰れていた。サンプリング時と更新時で状態が食い違い、
+            # PPO の重要度比が第0エポックから壊れる原因になっていたので float16 に変更。
+            # (36KB -> 18KB。値域は [-1, 4] 程度なので float16 の精度で十分)
+            "state_2d": state_dict["state_2d"].astype(np.float16),
+            "cond_vec": state_dict["cond_vec"].astype(np.float16),
             "seq_hist": state_dict["seq_hist"].astype(np.int16),
             "mask": mask.astype(np.int8)
         })
-        
+
         response = response_pipe.recv()
         action_val = response["action"]
-        
+
         if current_player == 0:
             log_prob_val = response["log_prob"]
             value_val = response["value"]
@@ -834,8 +952,12 @@ def async_environment_worker(worker_id, request_queue, response_pipe, trajectory
 
                 pending_transition["reward"] = accumulated_reward
                 pending_transition["done"] = False
+                # 【修正】GAE のブートストラップ用に、この遷移の「次状態」の価値を厳密に添付する。
+                # 以前は軌跡末端で values[-1] (= V(s_t) 自身) を V(s_{t+1}) として流用していた。
+                # ここでの value_val はまさに次の p0 決定局面 = s_{t+1} の価値なので厳密。
+                pending_transition["next_value"] = value_val
                 trajectory_queue.put(pending_transition)
-                
+
             accumulated_reward = 0.0
             env._pending_shanten_reduction = 0
 
@@ -859,7 +981,7 @@ def async_environment_worker(worker_id, request_queue, response_pipe, trajectory
                                 except ValueError:
                                     pass
                                 tiles34[i] -= 1
-                        
+
                         # 有効牌が1枚増えるごとに +0.0005 の報酬
                         accumulated_reward += ukeire_count * 0.0005
                     except ValueError:
@@ -892,6 +1014,7 @@ def async_environment_worker(worker_id, request_queue, response_pipe, trajectory
             if pending_transition is not None:
                 pending_transition["reward"] = accumulated_reward
                 pending_transition["done"] = True
+                pending_transition["next_value"] = 0.0  # 終端状態の価値は 0
                 pending_transition["metrics"] = local_metrics.copy()  # 半荘完了時にメトリクスを送信
                 trajectory_queue.put(pending_transition)
 
@@ -915,22 +1038,22 @@ def directml_safe_bce_with_logits(logits, targets):
 class HeroReplayBuffer:
     def __init__(self, max_size=10000):
         self.buffer = deque(maxlen=max_size)
-        
+
     def add(self, s_2d, c_vec, seq_h, action, mask):
         self.buffer.append((s_2d, c_vec, seq_h, action, mask))
-        
+
     def sample(self, batch_size):
         if len(self.buffer) == 0:
             return None
         batch_size = min(batch_size, len(self.buffer))
         batch = random.sample(self.buffer, batch_size)
-        
+
         s_2d = [item[0] for item in batch]
         c_vec = [item[1] for item in batch]
         seq_h = [item[2] for item in batch]
         actions = [item[3] for item in batch]
         masks = [item[4] for item in batch]
-        
+
         return s_2d, c_vec, seq_h, actions, masks
 
 
@@ -950,6 +1073,7 @@ class PPOBuffer:
                 "log_probs": [],
                 "rewards": [],
                 "state_values": [],
+                "next_values": [],
                 "dones": [],
             }
             for i in range(self.num_workers)
@@ -965,6 +1089,7 @@ class PPOBuffer:
         traj["log_probs"].append(step_data["log_prob"])
         traj["rewards"].append(step_data["reward"])
         traj["state_values"].append(step_data["value"])
+        traj["next_values"].append(step_data["next_value"])
         traj["dones"].append(step_data["done"])
 
 
@@ -983,6 +1108,18 @@ class PPOKLPenaltyTrainer:
         self.buffer = PPOBuffer(num_workers)
         self.hero_buffer = HeroReplayBuffer(max_size=10000)
 
+        # 【追加】KL 錨定を信頼できる次元だけに限定するマスク。
+        # 旧 SL データセットには reach / hora / pass サンプルが無いため、
+        # 48..53 の SL 事前分布はゼロ同然であり、KL はそこへ策略を引き戻してしまう
+        # (= 和了アクションを永久に殺す)。該当次元を除いた条件付き KL を用いる。
+        self.kl_trust_mask = torch.ones(A.N_ACTIONS, device=self.device)
+        for i in A.DECLARATION_ACTIONS:
+            self.kl_trust_mask[i] = 0.0
+
+        # 診断用: 直近の更新における第0エポックの重要度比 (1.0 から離れていたら
+        # サンプリング側と更新側で状態/モードが食い違っている)
+        self.last_first_epoch_ratio = float("nan")
+
     def set_learning_rate(self, new_lr):
         for g in self.optimizer.param_groups:
             g["lr"] = new_lr
@@ -1000,17 +1137,17 @@ class PPOKLPenaltyTrainer:
                 continue
 
             values = traj["state_values"]
+            next_values = traj["next_values"]
             dones = traj["dones"]
             T = len(rewards)
             total_steps += T
 
+            # 【修正】各遷移が自前で厳密な V(s_{t+1}) を持つ (worker 側で添付)。
+            # 以前は軌跡末端で V(s_t) を V(s_{t+1}) として流用していた。
             w_advantages = np.zeros(T, dtype=np.float32)
             gae = 0.0
-            next_val = values[-1] if not dones[-1] else 0.0
-
             for t in reversed(range(T)):
-                v_next = next_val if t == T - 1 else values[t + 1]
-                delta = rewards[t] + self.gamma * v_next * (1 - dones[t]) - values[t]
+                delta = rewards[t] + self.gamma * next_values[t] * (1 - dones[t]) - values[t]
                 gae = delta + self.gamma * self.gae_lambda * (1 - dones[t]) * gae
                 w_advantages[t] = gae
 
@@ -1105,6 +1242,10 @@ class PPOKLPenaltyTrainer:
 
                 log_diff = torch.clamp(new_log_probs - mb_old_log_probs, -5.0, 5.0)
                 ratios = torch.exp(log_diff)
+                if num_updates == 0:
+                    # 第0エポック・第0ミニバッチでは方策が未更新なので比は 1.0 のはず。
+                    # ここが 1 から離れる = サンプリングと更新で状態表現か train/eval モードが違う。
+                    self.last_first_epoch_ratio = float(ratios.mean().item())
                 ratios_bounded = torch.clamp(ratios, 0.0, 3.0)
 
                 surr1 = ratios_bounded * mb_advantages
@@ -1116,7 +1257,19 @@ class PPOKLPenaltyTrainer:
                 vf_loss2 = F.smooth_l1_loss(v_clipped, mb_returns, reduction="none")
                 value_loss = torch.max(vf_loss1, vf_loss2).mean()
 
-                kl_div = (sl_probs * (torch.log(torch.clamp(sl_probs, min=1e-8)) - log_probs_all)).sum(dim=-1).mean()
+                # 信頼できる次元のみに条件付けた KL (48..53 は SL 事前分布が死んでいるため除外)
+                trust = self.kl_trust_mask.unsqueeze(0) * mb_masks
+                sl_p_trusted = sl_probs * trust
+                new_p_trusted = new_probs * trust
+                sl_p_trusted = sl_p_trusted / sl_p_trusted.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                new_p_trusted = new_p_trusted / new_p_trusted.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                kl_div = (
+                    sl_p_trusted
+                    * (
+                        torch.log(torch.clamp(sl_p_trusted, min=1e-8))
+                        - torch.log(torch.clamp(new_p_trusted, min=1e-8))
+                    )
+                ).sum(dim=-1).mean()
 
                 loss_aux_t = directml_safe_bce_with_logits(aux_t, sl_t_target)
                 loss_aux_d = directml_safe_bce_with_logits(aux_d, sl_d_target)
@@ -1134,7 +1287,7 @@ class PPOKLPenaltyTrainer:
                         h_seqh_t = torch.tensor(np.array(h_seqh), dtype=torch.int64, device=self.device)
                         h_acts_t = torch.tensor(h_actions, dtype=torch.int64, device=self.device)
                         h_masks_t = torch.tensor(np.array(h_masks), dtype=torch.float32, device=self.device)
-                        
+
                         h_p_out, _, _, _, _ = self.model(h_s2d_t, h_cvec_t, h_seqh_t, rl_mode=True)
                         h_masked_logits = h_p_out + (1.0 - h_masks_t) * -1e9
                         sil_loss_val = F.cross_entropy(h_masked_logits, h_acts_t)
@@ -1151,6 +1304,10 @@ class PPOKLPenaltyTrainer:
                 num_updates += 1
 
         self.buffer.clear()
+        # 【修正】サンプリング (中央バッチ推論) は必ず eval モードで行う。
+        # 以前は train() のままだったため 18 個の Dropout2d(p=0.30) が有効になり、
+        # BatchNorm も 1~30 サンプルのミニバッチ統計を使っていた。
+        self.model.eval()
         if num_updates > 0:
             return total_ppo_loss / num_updates, total_entropy_val / num_updates
         return 0.0, 0.0
@@ -1180,6 +1337,18 @@ if __name__ == "__main__":
 
     base_policy_path = "smart_mahjong_base_policy_v2.pth"
 
+    # 【追加】死んだアクションヘッド (立直/ロン/ツモ/九種/パス) の修復スイッチ。
+    # 旧データセットで学習された重みからリスタートする場合は必ず 1 にする。
+    # 阶段2 で正しいラベルの SL を再学習したら 0 に戻すこと。
+    REPAIR_HEAD = os.environ.get("MJ_REPAIR_HEAD", "1") == "1"
+    CALL_LOGIT_PENALTY = float(os.environ.get("MJ_CALL_PENALTY", DEFAULT_CALL_LOGIT_PENALTY))
+
+    def load_policy(path, repair=REPAIR_HEAD):
+        sd = adapt_policy_state_dict(torch.load(path, map_location="cpu", weights_only=False))
+        if repair:
+            sd = repair_policy_head(sd, call_logit_penalty=CALL_LOGIT_PENALTY)
+        return sd
+
     resume_path = None
     current_phase = 1
 
@@ -1200,7 +1369,7 @@ if __name__ == "__main__":
             break
 
     if resume_path:
-        model.load_state_dict(adapt_policy_state_dict(torch.load(resume_path, map_location="cpu", weights_only=False)))
+        model.load_state_dict(load_policy(resume_path))
         print(
             f" -> [Info] レジューム（断点続行）: Phase {current_phase} の履歴重み {resume_path} の検出・読み込みに成功しました"
         )
@@ -1213,24 +1382,16 @@ if __name__ == "__main__":
             ]
             sl_resume_path = next((path for path in sl_candidates if os.path.exists(path)), base_policy_path)
             if os.path.exists(sl_resume_path):
-                sl_base_model.load_state_dict(
-                    adapt_policy_state_dict(torch.load(sl_resume_path, map_location="cpu", weights_only=False))
-                )
+                sl_base_model.load_state_dict(load_policy(sl_resume_path))
                 print(f" -> [Info] 動的SLベースライン: Phase {prev_phase} のモデルで初期化しました ({sl_resume_path})")
         else:
             if os.path.exists(base_policy_path):
-                sl_base_model.load_state_dict(
-                    adapt_policy_state_dict(torch.load(base_policy_path, map_location="cpu", weights_only=False))
-                )
+                sl_base_model.load_state_dict(load_policy(base_policy_path))
                 print(f" -> [Info] SLベースポリシーを読み込みました: {base_policy_path}")
     else:
         if os.path.exists(base_policy_path):
-            model.load_state_dict(
-                adapt_policy_state_dict(torch.load(base_policy_path, map_location="cpu", weights_only=False))
-            )
-            sl_base_model.load_state_dict(
-                adapt_policy_state_dict(torch.load(base_policy_path, map_location="cpu", weights_only=False))
-            )
+            model.load_state_dict(load_policy(base_policy_path))
+            sl_base_model.load_state_dict(load_policy(base_policy_path))
             print(
                 " -> [Info] 利用可能なチェックポイントが検出されませんでした。SLベースポリシーから全く新しい Phase 1 の学習を開始します"
             )
@@ -1247,11 +1408,18 @@ if __name__ == "__main__":
     trainer = PPOKLPenaltyTrainer(
         model, sl_base_model, device, num_workers=NUM_WORKERS, lr=current_lr, kl_beta=current_kl
     )
+    # 【修正】サンプリングは常に eval モード (Dropout 無効・BN は移動平均) で行う
+    trainer.model.eval()
     ckpt_manager = CheckpointManager(max_keep=3)
     logger = TrainingLogger()
 
+    dead_now, _, _ = diagnose_policy_head(trainer.model.state_dict())
+    print(
+        f" -> [Head Check] 起動時の死行: {[A.ACTION_NAMES[i] for i in dead_now] if dead_now else 'なし'}"
+    )
+
     trajectory_queue: mp.Queue = mp.Queue(maxsize=NUM_WORKERS * 4 * STEPS_PER_WORKER)
-    
+
     # 【新增】建立集中式批量推理 IPC 通道
     request_queue: mp.Queue = mp.Queue()
     parent_pipes = []
@@ -1264,7 +1432,7 @@ if __name__ == "__main__":
     workers = []
     for i in range(NUM_WORKERS):
         proc = mp.Process(
-            target=async_environment_worker, 
+            target=async_environment_worker,
             args=(i, request_queue, child_pipes[i], trajectory_queue, STEPS_PER_WORKER, shared_phase)
         )
         proc.start()
@@ -1318,13 +1486,13 @@ if __name__ == "__main__":
                         total_wins += m["win_count"]
                         total_deal_ins += m["deal_in_count"]
                         total_shanten_reduction += m["shanten_reduction"]
-                        
+
                     if added_steps >= TARGET_BUFFER_SIZE:
                         break
-                        
+
                 if added_steps >= TARGET_BUFFER_SIZE:
                     break
-                    
+
                 # 2. 集中型GPUバッチ推論 (Central Batch Inference)
                 requests = []
                 try:
@@ -1339,14 +1507,14 @@ if __name__ == "__main__":
                             break
                 except queue.Empty:
                     pass
-                    
+
                 if requests:
                     # バッチの結合
                     b_s2d = torch.tensor(np.array([r["state_2d"] for r in requests]), dtype=torch.float32, device=device)
                     b_cvec = torch.tensor(np.array([r["cond_vec"] for r in requests]), dtype=torch.float32, device=device)
                     b_seqh = torch.tensor(np.array([r["seq_hist"] for r in requests]), dtype=torch.int64, device=device)
                     b_mask = torch.tensor(np.array([r["mask"] for r in requests]), dtype=torch.float32, device=device)
-                    
+
                     # GPUフォワードパス
                     with torch.no_grad():
                         p_out, v_score, _, _, _ = trainer.model(b_s2d, b_cvec, b_seqh, rl_mode=True)
@@ -1355,11 +1523,11 @@ if __name__ == "__main__":
                         dist = torch.distributions.Categorical(probs)
                         actions = dist.sample()
                         log_probs = dist.log_prob(actions)
-                        
+
                     actions_np = actions.cpu().numpy()
                     v_score_np = v_score.squeeze(-1).cpu().numpy()
                     log_probs_np = log_probs.cpu().numpy()
-                    
+
                     # Pipe経由で結果を対応するWorkerに正確に分配
                     for idx, r in enumerate(requests):
                         w_id = r["worker_id"]
@@ -1395,8 +1563,13 @@ if __name__ == "__main__":
             mean_shanten_red = total_shanten_reduction / max(1, total_hands)
 
             print(
-                f"✅ Iter [{it:04d}] Phase {current_phase} | Loss: {ppo_loss:.4f} | R: {avg_reward:.4f} | Ent: {avg_entropy:.4f} | Win: {win_rate:.2%} | Deal-in: {deal_in_rate:.2%} | ΔShanten: +{mean_shanten_red:.2f}"
+                f"✅ Iter [{it:04d}] Phase {current_phase} | Loss: {ppo_loss:.4f} | R: {avg_reward:.4f} | Ent: {avg_entropy:.4f} | Win: {win_rate:.2%} | Deal-in: {deal_in_rate:.2%} | ΔShanten: +{mean_shanten_red:.2f} | ratio0: {trainer.last_first_epoch_ratio:.4f}"
             )
+            if abs(trainer.last_first_epoch_ratio - 1.0) > 0.02:
+                print(
+                    f"⚠️ [Sanity] 第0エポックの重要度比が {trainer.last_first_epoch_ratio:.4f} です "
+                    "(期待値 1.00±0.02)。サンプリングと更新で状態表現か train/eval モードが食い違っています。"
+                )
             logger.log_train(
                 it, current_phase, ppo_loss, avg_reward, avg_entropy, win_rate, deal_in_rate, mean_shanten_red
             )
@@ -1509,7 +1682,7 @@ if __name__ == "__main__":
                             # 対戦相手は Phase 2 の卒業モデル。同レベルの対戦では Rank 2.5 が引き分け。
                             # Rank <= 2.45 かつ 純スコア > 0 を達成し、純粋なRLがUkeireヒューリスティックモデルを確実に超えたことを証明する必要がある。
                             phase3_success = (avg_rank <= 2.45) and (avg_net > 0)
-                            
+
                             if phase3_success:
                                 print(
                                     f"\n👑 [Grand Finale] Phase 3 完璧にクリア！(Rank:{avg_rank:.3f}, Net:{avg_net:.1f}pt)。"

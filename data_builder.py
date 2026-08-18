@@ -1,394 +1,362 @@
+"""
+HDF5 データセット構築 (Dataset builder)
+
+旧版からの主な変更:
+  * サンプル生成は mjai_parser.MjaiReplayParser に委譲 (打牌 / 鳴き応答 / 立直宣言 / 和了)
+  * state_2d を state_codec でパックして保存 (36 KB -> 7.2 KB、lzf 圧縮後は実測 約 0.47 KB)
+  * ファイル順ではなく **対局単位のシャッフル** で train / val / test に分割
+    (旧: selected_files[:split_idx]。しかも mjson_files[:max_files] で先頭 5000 件しか使っていなかった)
+  * 牌譜解析を複数プロセスで並列化 (向聴計算が支配的な CPU バウンド処理)
+  * schema バージョン・ソースマニフェスト・統計レポートを保存
+
+usage:
+    python data_builder.py --max-files 40000 --workers 12 --out data_v3
+"""
+
+from __future__ import annotations
+
+import argparse
 import glob
-import gzip
+import hashlib
 import json
+import multiprocessing as mp
 import os
-import traceback
+import subprocess
+import sys
+import time
+from collections import Counter
 
 import h5py
 import numpy as np
-
-# 注意: 向聴数（Shanten）と待ち牌（Waits）を正確に計算するため、
-# 標準の mahjong ライブラリを使用します。(pip install mahjong)
-from mahjong.shanten import Shanten
 from tqdm import tqdm
 
-from feature_extractor import (
-    MahjongFeatureExtractor256,
-    MahjongGameState,
-    PlayerState,
-    parse_tile,
+import actions as A
+from feature_extractor import MahjongFeatureExtractor256
+from mjai_parser import MjaiReplayParser, ReplayFormatError
+from state_codec import (
+    BIN_CHANNELS,
+    CTX_CHANNELS,
+    DEC_FIELDS,
+    NUM_TILES,
+    assert_roundtrip,
+    pack_state,
+    unpack_state,
 )
 
-# ==========================================
-# 1. アクションID定義 (Action ID Definitions)
-# ==========================================
-ACTION_PASS = 0
-ACTION_CHI = 1
-ACTION_PON = 2
-ACTION_KAN = 3
-ACTION_RIICHI = 4
-ACTION_HORA = 5
+
+def _use_utf8_stdout() -> None:
+    """Windows の既定コンソール (cp932/gbk) で日本語ログが落ちないようにする"""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
 
 
-def create_initial_game_state() -> MahjongGameState:
-    """
-    初期状態の MahjongGameState オブジェクトを生成する。
-    （生成初始状态的 MahjongGameState 对象）
-    """
-    players = [PlayerState(seat=i) for i in range(4)]
-    return MahjongGameState(self_seat=0, players=players, closed_hand=[], dora_indicators=[], global_discards=[])
+SCHEMA_VERSION = 3
+FEATURE_VERSION = "256ch-v3-decision-context"
+
+# HDF5 データセット名 -> (1 サンプルあたりの形状, dtype)
+FIELDS: dict[str, tuple[tuple[int, ...], str]] = {
+    "state_bin": ((BIN_CHANNELS, NUM_TILES), "uint8"),
+    "state_ctx": ((CTX_CHANNELS,), "float32"),
+    "state_dec": ((DEC_FIELDS,), "int16"),
+    "cond_vec": ((16,), "float32"),
+    "seq_hist": ((72,), "int16"),
+    "target_action": ((), "int16"),
+    "legal_mask": ((A.N_ACTIONS,), "uint8"),
+    "decision_type": ((), "int8"),
+    "target_score": ((), "float32"),
+    "target_tenpai": ((3,), "float32"),
+    "target_danger": ((102,), "float32"),
+    "target_waits": ((102,), "float32"),
+    "game_id": ((), "int32"),
+    "kyoku_id": ((), "int16"),
+    "step_id": ((), "int16"),
+    "actor": ((), "int8"),
+}
 
 
-def calculate_waits_matrix(act_seat: int, current_hands: dict, shanten_calculator: Shanten) -> np.ndarray:
-    """
-    他家3人の手牌からテンパイ状態（聴牌状態）を判定し、
-    102次元（3家 × 34牌）の待ち牌マトリックス（待牌マトリックス）を生成する。
-    （计算除行动者外其余三家的听牌待牌矩阵）
-    """
-    waits_matrix = np.zeros(102, dtype=np.float32)
-
-    for rel_p in range(1, 4):
-        target_id = (act_seat + rel_p) % 4
-        target_hand = current_hands[target_id]
-
-        # 34次元の牌カウント配列に変換 (转换为34维计数组)
-        tiles_34 = [0] * 34
-        for tile_str in target_hand:
-            if tile_str != "?":  # 未知の牌は無視
-                t_id, _ = parse_tile(tile_str)
-                tiles_34[t_id] += 1
-
-        # 手牌が13枚（またはそれ以下で副露済み）の場合、向聴数を計算
-        if sum(tiles_34) % 3 == 1:
-            shanten = shanten_calculator.calculate_shanten(tiles_34)
-            # 向聴数 == 0 ならテンパイ（聴牌）
-            if shanten == 0:
-                # 34種の牌を順番に加えて和了（アガリ / Shanten == -1）になるかテスト
-                for i in range(34):
-                    if tiles_34[i] < 4:
-                        tiles_34[i] += 1
-                        if shanten_calculator.calculate_shanten(tiles_34) == -1:
-                            # 和了できる牌なら待ち牌として 1.0 を立てる
-                            waits_matrix[(rel_p - 1) * 34 + i] = 1.0
-                        tiles_34[i] -= 1
-
-    return waits_matrix
+def git_hash() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+    except Exception:
+        return "unknown"
 
 
-class MjaiLogParser:
-    """
-    MJAI形式のログを解析し、マルチタスク学習用の特徴量とラベルを抽出する。
-    V2: 256チャネル対応および aux_waits のラベル抽出を追加。
-    """
+def manifest_digest(paths: list[str]) -> str:
+    h = hashlib.sha256()
+    for p in sorted(paths):
+        h.update(os.path.basename(p).encode("utf-8"))
+    return h.hexdigest()
 
-    def __init__(self, extractor: MahjongFeatureExtractor256):
-        self.extractor = extractor
-        self.shanten_calculator = Shanten()  # 向聴数計算機を初期化
 
-    def parse_file(self, file_path: str):
-        main_buffer = {
-            "state_2d": [],
-            "cond_vec": [],
-            "seq_hist": [],
-            "t_disc": [],
-            "t_act": [],
-            "m_disc": [],
-            "m_act": [],
-            "t_score": [],
-            "t_tenpai": [],
-            "t_danger": [],
-            "t_waits": [],  # V2: 敵方待牌分布ラベル (Enemy waits distribution) [102次元]
+def samples_to_arrays(samples, game_id: int) -> dict[str, np.ndarray]:
+    """Sample のリストを HDF5 に書ける配列辞書へ変換する (worker プロセス側で実行)"""
+    packed = [pack_state(s.state_2d) for s in samples]
+    return {
+        "state_bin": np.stack([p[0] for p in packed]),
+        "state_ctx": np.stack([p[1] for p in packed]),
+        "state_dec": np.stack([p[2] for p in packed]),
+        "cond_vec": np.stack([s.cond_vec for s in samples]).astype(np.float32),
+        "seq_hist": np.stack([s.seq_hist for s in samples]).astype(np.int16),
+        "target_action": np.array([s.action for s in samples], dtype=np.int16),
+        "legal_mask": np.stack([s.legal_mask for s in samples]).astype(np.uint8),
+        "decision_type": np.array([s.decision_type for s in samples], dtype=np.int8),
+        "target_score": np.array([s.score_hand for s in samples], dtype=np.float32),
+        "target_tenpai": np.stack([s.tenpai for s in samples]).astype(np.float32),
+        "target_danger": np.stack([s.danger for s in samples]).astype(np.float32),
+        "target_waits": np.stack([s.waits for s in samples]).astype(np.float32),
+        "game_id": np.full(len(samples), game_id, dtype=np.int32),
+        "kyoku_id": np.array([s.kyoku_index for s in samples], dtype=np.int16),
+        "step_id": np.array([s.step_index for s in samples], dtype=np.int16),
+        "actor": np.array([s.actor for s in samples], dtype=np.int8),
+    }
+
+
+class DatasetWriter:
+    """1 つの HDF5 スプリットへの追記を担当する"""
+
+    CHUNK = 256
+
+    def __init__(self, path: str, compression: str | None = "lzf"):
+        self.path = path
+        self.h5 = h5py.File(path, "w")
+        kw = {"compression": compression} if compression else {}
+        self.ds = {
+            name: self.h5.create_dataset(
+                name,
+                shape=(0, *shape),
+                maxshape=(None, *shape),
+                dtype=dtype,
+                chunks=(self.CHUNK, *shape),
+                **kw,
+            )
+            for name, (shape, dtype) in FIELDS.items()
         }
+        self.n = 0
+        self.stats: Counter = Counter()
+        self.score_sum = 0.0
+        self.score_sq = 0.0
 
-        kyoku_buffer = {
-            "actor": [],
-            "state_2d": [],
-            "cond_vec": [],
-            "seq_hist": [],
-            "t_disc": [],
-            "t_act": [],
-            "m_disc": [],
-            "m_act": [],
-            "current_hands_snapshot": [],  # 毎ステップの他家手牌状態を保存し、後で待ち牌を計算
+    def append(self, arrays: dict[str, np.ndarray]) -> None:
+        count = len(arrays["target_action"])
+        if count == 0:
+            return
+        for name, ds in self.ds.items():
+            ds.resize(self.n + count, axis=0)
+            ds[self.n : self.n + count] = arrays[name]
+        self.n += count
+
+        for action in arrays["target_action"]:
+            self.stats[A.ACTION_NAMES[int(action)]] += 1
+        for decision in arrays["decision_type"]:
+            self.stats[f"decision_{int(decision)}"] += 1
+        scores = arrays["target_score"].astype(np.float64)
+        self.score_sum += float(scores.sum())
+        self.score_sq += float((scores**2).sum())
+
+    def close(self, meta: dict) -> dict:
+        report = {
+            "num_samples": self.n,
+            "action_distribution": dict(self.stats),
+            "score_mean": self.score_sum / max(1, self.n),
+            "score_rms": (self.score_sq / max(1, self.n)) ** 0.5,
         }
+        for key, value in {**meta, "report": json.dumps(report, ensure_ascii=False)}.items():
+            self.h5.attrs[key] = value
+        self.h5.close()
+        return report
 
-        game_state = create_initial_game_state()
-        player_hands = {0: [], 1: [], 2: [], 3: []}
 
-        try:
-            with open(file_path, "rb") as f_test:
-                magic_bytes = f_test.read(2)
+# --- 並列解析 ---------------------------------------------------------------
+_WORKER_PARSER: MjaiReplayParser | None = None
 
-            open_fn = gzip.open if magic_bytes == b"\x1f\x8b" else open
-            with open_fn(file_path, "rt", encoding="utf-8") as f:
-                content = f.read().strip()
-                if not content:
-                    return None
 
-                if content.startswith("["):
-                    events = json.loads(content)
-                else:
-                    events = [json.loads(line) for line in content.split("\n") if line.strip()]
+def _worker_init(call_negative_rate: float, seed: int) -> None:
+    global _WORKER_PARSER
+    _use_utf8_stdout()
+    _WORKER_PARSER = MjaiReplayParser(
+        MahjongFeatureExtractor256(),
+        call_negative_rate=call_negative_rate,
+        rng=np.random.default_rng(seed + os.getpid()),
+    )
 
-        except Exception as e:
-            print(f"\n[デコードエラー] {file_path}: {e}")
-            return None
 
-        def flush_kyoku_buffer(score_changes):
-            for i in range(len(kyoku_buffer["actor"])):
-                act = kyoku_buffer["actor"][i]
-                main_buffer["state_2d"].append(kyoku_buffer["state_2d"][i])
-                main_buffer["cond_vec"].append(kyoku_buffer["cond_vec"][i])
-                main_buffer["seq_hist"].append(kyoku_buffer["seq_hist"][i])
-                main_buffer["t_disc"].append(kyoku_buffer["t_disc"][i])
-                main_buffer["t_act"].append(kyoku_buffer["t_act"][i])
-                main_buffer["m_disc"].append(kyoku_buffer["m_disc"][i])
-                main_buffer["m_act"].append(kyoku_buffer["m_act"][i])
+def _worker_parse(item):
+    game_id, path = item
+    try:
+        samples = _WORKER_PARSER.parse_file(path)
+    except (ReplayFormatError, ValueError, KeyError, IndexError) as exc:
+        return None, type(exc).__name__
+    if not samples:
+        return None, "EmptyReplay"
+    return samples_to_arrays(samples, game_id), None
 
-                delta_score = score_changes[act] / 10000.0 if act < len(score_changes) else 0.0
-                main_buffer["t_score"].append(delta_score)
 
-                # プレースホルダーとしてゼロ初期化（後続タスクで拡充可能）
-                main_buffer["t_tenpai"].append(np.zeros(3, dtype=np.float32))
-                main_buffer["t_danger"].append(np.zeros(102, dtype=np.float32))
+def _build_split(
+    split_name: str,
+    split_files: list[str],
+    out_path: str,
+    *,
+    workers: int,
+    compression: str | None,
+    call_negative_rate: float,
+    seed: int,
+    verify_every: int,
+    common_meta: dict,
+) -> None:
+    print(f"\n--- 構築開始: {out_path} ({len(split_files)} 対局, workers={workers}) ---")
+    writer = DatasetWriter(out_path, compression=compression)
+    failures: Counter = Counter()
+    next_verify = 0
+    items = list(enumerate(split_files))
 
-                # V2: 毎ステップ記録した手牌スナップショットから待牌マトリックスを計算
-                hands_snapshot = kyoku_buffer["current_hands_snapshot"][i]
-                waits_matrix = calculate_waits_matrix(act, hands_snapshot, self.shanten_calculator)
-                main_buffer["t_waits"].append(waits_matrix)
+    def consume(result):
+        nonlocal next_verify
+        arrays, error = result
+        if error:
+            failures[error] += 1
+            return
+        writer.append(arrays)
+        if writer.n >= next_verify:
+            # 保存形式の可逆性を定期検査 (復元して形状と値域を確認)
+            restored = unpack_state(
+                arrays["state_bin"][0], arrays["state_ctx"][0], arrays["state_dec"][0]
+            )
+            assert restored.shape == (256, 4, 9), restored.shape
+            next_verify = writer.n + verify_every
 
-            for val in kyoku_buffer.values():
-                val.clear()
+    if workers <= 1:
+        _worker_init(call_negative_rate, seed)
+        for item in tqdm(items, desc=f"Parsing {split_name}"):
+            consume(_worker_parse(item))
+    else:
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(
+            processes=workers, initializer=_worker_init, initargs=(call_negative_rate, seed)
+        ) as pool:
+            for result in tqdm(
+                pool.imap_unordered(_worker_parse, items, chunksize=4),
+                total=len(items),
+                desc=f"Parsing {split_name}",
+            ):
+                consume(result)
 
-        try:
-            for event in events:
-                type_str = event.get("type")
+    report = writer.close(
+        {
+            **common_meta,
+            "split": split_name,
+            "source_manifest_sha256": manifest_digest(split_files),
+        }
+    )
+    size_gb = os.path.getsize(out_path) / 1e9
+    print(f"[完了] {out_path}: {report['num_samples']:,} サンプル / {size_gb:.2f} GB")
+    if failures:
+        print(f"  解析失敗: {dict(failures)}")
+    print(f"  score_hand mean={report['score_mean']:+.4f} rms={report['score_rms']:.4f}")
+    grouped: Counter = Counter()
+    for key, value in report["action_distribution"].items():
+        if key.startswith("decision_"):
+            continue
+        grouped["DISCARD" if key.startswith("DISCARD") else key] += value
+    print(f"  アクション分布: {dict(sorted(grouped.items(), key=lambda kv: -kv[1]))}")
 
-                if type_str == "start_kyoku":
-                    game_state = create_initial_game_state()
-                    wind_map = {"E": 0, "S": 1, "W": 2, "N": 3}
-                    game_state.round_wind = wind_map.get(event.get("bakaze", "E"), 0)
-                    game_state.honba = event.get("honba", 0)
-                    game_state.kyotaku = event.get("kyotaku", 0)
 
-                    if event.get("dora_marker"):
-                        game_state.dora_indicators = [event.get("dora_marker")]
+def build_dataset(
+    log_dir: str,
+    output_dir: str,
+    max_files: int | None = None,
+    split=(0.90, 0.05, 0.05),
+    seed: int = 20260818,
+    call_negative_rate: float = 1.0,
+    compression: str | None = "lzf",
+    workers: int = 1,
+    verify_every: int = 20000,
+) -> None:
+    os.makedirs(output_dir, exist_ok=True)
 
-                    for p_idx, tehai in enumerate(event.get("tehais", [[], [], [], []])):
-                        player_hands[p_idx] = list(tehai)
+    files = sorted(glob.glob(os.path.join(log_dir, "**", "*.mjson"), recursive=True))
+    if not files:
+        files = sorted(glob.glob(os.path.join(log_dir, "**", "*.json"), recursive=True))
+    if not files:
+        raise SystemExit(f"[エラー] 牌譜が見つかりません: {log_dir}")
 
-                elif type_str == "dora":
-                    game_state.dora_indicators.append(event.get("dora_marker"))
+    print(f"[検索完了] 牌譜ファイル数: {len(files)}")
 
-                elif type_str == "tsumo":
-                    actor = event.get("actor")
-                    tile = event.get("pai")
-                    if actor is not None and tile != "?":
-                        player_hands[actor].append(tile)
+    # 【修正】旧版は files[:max_files] で **先頭 5000 件** しか使わず、split もファイル順だった。
+    # ここでは固定シードでシャッフルしてから対局単位で切る。
+    rng = np.random.default_rng(seed)
+    files = [files[i] for i in rng.permutation(len(files))]
+    if max_files:
+        files = files[:max_files]
 
-                elif type_str == "dahai":
-                    actor = event.get("actor")
-                    tile = event.get("pai")
-                    is_tsumogiri = event.get("tsumogiri", False)
+    n_train = int(len(files) * split[0])
+    n_val = int(len(files) * split[1])
+    splits = {
+        "train": files[:n_train],
+        "val": files[n_train : n_train + n_val],
+        "test": files[n_train + n_val :],
+    }
+    print(
+        f"[分割] train={len(splits['train'])} / val={len(splits['val'])} / test={len(splits['test'])} "
+        f"(対局単位, seed={seed})"
+    )
 
-                    if actor is not None and actor in player_hands:
-                        game_state.self_seat = actor
-                        game_state.closed_hand = list(player_hands[actor])
+    common_meta = {
+        "schema_version": SCHEMA_VERSION,
+        "feature_version": FEATURE_VERSION,
+        "action_space": "pymahjong-54",
+        "builder_git_hash": git_hash(),
+        "build_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "seed": seed,
+        "call_negative_rate": call_negative_rate,
+    }
 
-                        feats = self.extractor.extract(game_state)
-                        tile_id, _ = parse_tile(tile)
-
-                        # V2: seq_hist を 0~272 の複合 Token に変換
-                        raw_seq = feats.get("seq_hist", np.full(72, 34, dtype=np.int64))
-                        cut_type = 0 if is_tsumogiri else 1
-
-                        encoded_seq = []
-                        for t in raw_seq:
-                            if t >= 34:
-                                encoded_seq.append(272)
-                            else:
-                                token = int(t) * 8 + 0 * 2 + cut_type
-                                encoded_seq.append(min(token, 272))
-
-                        encoded_seq = np.array(encoded_seq, dtype=np.int64)
-
-                        kyoku_buffer["actor"].append(actor)
-                        kyoku_buffer["state_2d"].append(feats["state_2d"])
-                        kyoku_buffer["cond_vec"].append(feats["cond_vec"])
-                        kyoku_buffer["seq_hist"].append(encoded_seq)
-                        kyoku_buffer["t_disc"].append(tile_id)
-                        kyoku_buffer["t_act"].append(ACTION_PASS)
-                        kyoku_buffer["m_disc"].append(1.0)
-                        kyoku_buffer["m_act"].append(0.0)
-
-                        # 手牌スナップショットをディープコピーして保存 (ディープコピーによる状態の保存)
-                        snapshot = {k: list(v) for k, v in player_hands.items()}
-                        kyoku_buffer["current_hands_snapshot"].append(snapshot)
-
-                    if tile in player_hands[actor]:
-                        player_hands[actor].remove(tile)
-                    game_state.players[actor].discards.append(tile)
-                    game_state.players[actor].is_tsumogiri.append(is_tsumogiri)
-                    game_state.global_discards.append(tile)
-
-                elif type_str in ["chi", "pon", "daiminkan"]:
-                    actor = event.get("actor")
-                    consumed = event.get("consumed", [])
-
-                    if actor is not None and actor in player_hands:
-                        game_state.self_seat = actor
-                        game_state.closed_hand = list(player_hands[actor])
-
-                        feats = self.extractor.extract(game_state)
-                        raw_seq = feats.get("seq_hist", np.full(72, 34, dtype=np.int64))
-                        encoded_seq = np.where(raw_seq >= 34, 272, raw_seq * 8)
-
-                        act_id = ACTION_CHI if type_str == "chi" else (ACTION_PON if type_str == "pon" else ACTION_KAN)
-
-                        kyoku_buffer["actor"].append(actor)
-                        kyoku_buffer["state_2d"].append(feats["state_2d"])
-                        kyoku_buffer["cond_vec"].append(feats["cond_vec"])
-                        kyoku_buffer["seq_hist"].append(encoded_seq)
-                        kyoku_buffer["t_disc"].append(0)
-                        kyoku_buffer["t_act"].append(act_id)
-                        kyoku_buffer["m_disc"].append(0.0)
-                        kyoku_buffer["m_act"].append(1.0)
-
-                        snapshot = {k: list(v) for k, v in player_hands.items()}
-                        kyoku_buffer["current_hands_snapshot"].append(snapshot)
-
-                    for c_tile in consumed:
-                        if c_tile in player_hands[actor]:
-                            player_hands[actor].remove(c_tile)
-
-                    meld_tiles = consumed + [event.get("pai", "")]
-                    game_state.players[actor].melds.append(meld_tiles)
-
-                elif type_str == "reach":
-                    actor = event.get("actor")
-                    if actor is not None:
-                        game_state.players[actor].is_riichi = True
-                        game_state.players[actor].riichi_turn = len(game_state.players[actor].discards)
-
-                elif type_str in ["hora", "ryukyoku"]:
-                    score_changes = [0, 0, 0, 0]
-                    if type_str == "hora":
-                        pass
-                    flush_kyoku_buffer(score_changes)
-
-        except Exception:
-            print(f"\n[ロジックエラー] {file_path} の処理中に例外が発生しました:")
-            traceback.print_exc()
-            return None
-
-        if not main_buffer["state_2d"]:
-            return None
-
-        return (
-            np.array(main_buffer["state_2d"], dtype=np.float32),
-            np.array(main_buffer["cond_vec"], dtype=np.float32),
-            np.array(main_buffer["seq_hist"], dtype=np.int64),
-            np.array(main_buffer["t_disc"], dtype=np.int64),
-            np.array(main_buffer["t_act"], dtype=np.int64),
-            np.array(main_buffer["m_disc"], dtype=np.float32),
-            np.array(main_buffer["m_act"], dtype=np.float32),
-            np.array(main_buffer["t_score"], dtype=np.float32),
-            np.array(main_buffer["t_tenpai"], dtype=np.float32),
-            np.array(main_buffer["t_danger"], dtype=np.float32),
-            np.array(main_buffer["t_waits"], dtype=np.float32),  # V2 追加
+    for split_name, split_files in splits.items():
+        if not split_files:
+            continue
+        _build_split(
+            split_name,
+            split_files,
+            os.path.join(output_dir, f"{split_name}_dataset.h5"),
+            workers=workers,
+            compression=compression,
+            call_negative_rate=call_negative_rate,
+            seed=seed,
+            verify_every=verify_every,
+            common_meta=common_meta,
         )
 
 
-# ==========================================
-# 2. HDF5 データセット構築 (Dataset Builder)
-# ==========================================
-
-
-def build_dataset(log_dir: str, output_dir: str, max_files: int = 5000):
-    os.makedirs(output_dir, exist_ok=True)
-    mjson_files = glob.glob(os.path.join(log_dir, "**", "*.mjson"), recursive=True)
-    if not mjson_files:
-        mjson_files = glob.glob(os.path.join(log_dir, "**", "*.json"), recursive=True)
-
-    print(f"[検索完了] 検出された牌譜ファイル数: {len(mjson_files)}")
-    if len(mjson_files) == 0:
-        return
-
-    selected_files = mjson_files[:max_files]
-    split_idx = int(len(selected_files) * 0.9)
-    train_files = selected_files[:split_idx]
-    val_files = selected_files[split_idx:]
-
-    extractor = MahjongFeatureExtractor256()  # V2: 256チャネルExtractorを使用
-    parser = MjaiLogParser(extractor)
-
-    def process_and_save(file_list, h5_path):
-        print(f"\n--- HDF5 作成開始: {h5_path} ---")
-        with h5py.File(h5_path, "w") as h5f:
-            # V2: state_2d のチャネル数を 128 から 256 に変更
-            ds_state = h5f.create_dataset(
-                "state_2d", shape=(0, 256, 4, 9), maxshape=(None, 256, 4, 9), dtype="float32", chunks=(128, 256, 4, 9)
-            )
-            ds_cond = h5f.create_dataset("cond_vec", shape=(0, 16), maxshape=(None, 16), dtype="float32")
-            ds_seq = h5f.create_dataset("seq_hist", shape=(0, 72), maxshape=(None, 72), dtype="int64")
-
-            ds_t_disc = h5f.create_dataset("target_discards", shape=(0,), maxshape=(None,), dtype="int64")
-            ds_t_act = h5f.create_dataset("target_actions", shape=(0,), maxshape=(None,), dtype="int64")
-            ds_m_disc = h5f.create_dataset("mask_discards", shape=(0,), maxshape=(None,), dtype="float32")
-            ds_m_act = h5f.create_dataset("mask_actions", shape=(0,), maxshape=(None,), dtype="float32")
-
-            ds_t_score = h5f.create_dataset("target_score", shape=(0,), maxshape=(None,), dtype="float32")
-            ds_t_tenpai = h5f.create_dataset("target_tenpai", shape=(0, 3), maxshape=(None, 3), dtype="float32")
-            ds_t_danger = h5f.create_dataset("target_danger", shape=(0, 102), maxshape=(None, 102), dtype="float32")
-
-            # V2: aux_waits 用のデータセットを追加
-            ds_t_waits = h5f.create_dataset("target_waits", shape=(0, 102), maxshape=(None, 102), dtype="float32")
-
-            total_samples = 0
-            for fpath in tqdm(file_list, desc="Processing Logs"):
-                res = parser.parse_file(fpath)
-                if res is None:
-                    continue
-
-                state, cond, seq, t_disc, t_act, m_disc, m_act, t_score, t_tenpai, t_danger, t_waits = res
-                n_samples = state.shape[0]
-
-                for ds in [
-                    ds_state,
-                    ds_cond,
-                    ds_seq,
-                    ds_t_disc,
-                    ds_t_act,
-                    ds_m_disc,
-                    ds_m_act,
-                    ds_t_score,
-                    ds_t_tenpai,
-                    ds_t_danger,
-                    ds_t_waits,
-                ]:
-                    ds.resize(total_samples + n_samples, axis=0)
-
-                ds_state[total_samples : total_samples + n_samples] = state
-                ds_cond[total_samples : total_samples + n_samples] = cond
-                ds_seq[total_samples : total_samples + n_samples] = seq
-                ds_t_disc[total_samples : total_samples + n_samples] = t_disc
-                ds_t_act[total_samples : total_samples + n_samples] = t_act
-                ds_m_disc[total_samples : total_samples + n_samples] = m_disc
-                ds_m_act[total_samples : total_samples + n_samples] = m_act
-                ds_t_score[total_samples : total_samples + n_samples] = t_score
-                ds_t_tenpai[total_samples : total_samples + n_samples] = t_tenpai
-                ds_t_danger[total_samples : total_samples + n_samples] = t_danger
-                ds_t_waits[total_samples : total_samples + n_samples] = t_waits  # V2: 追加
-
-                total_samples += n_samples
-
-            print(f"[完了] 総サンプル数 (Total Samples): {total_samples}")
-
-    process_and_save(train_files, os.path.join(output_dir, "train_dataset.h5"))
-    process_and_save(val_files, os.path.join(output_dir, "val_dataset.h5"))
-
-
 if __name__ == "__main__":
-    LOGS_PATH = "data/logs/2024_mjai"
-    OUTPUT_PATH = "data"
-    build_dataset(LOGS_PATH, OUTPUT_PATH, max_files=5000)
+    _use_utf8_stdout()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--logs", default="data/logs/2024_mjai")
+    ap.add_argument("--out", default="data_v3")
+    ap.add_argument("--max-files", type=int, default=None, help="使用する牌譜数 (既定: 全件)")
+    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
+    ap.add_argument("--call-negative-rate", type=float, default=1.0)
+    ap.add_argument("--compression", default="lzf", choices=["lzf", "gzip", "none"])
+    ap.add_argument("--seed", type=int, default=20260818)
+    args = ap.parse_args()
+
+    # 保存形式の可逆性を起動時に 1 度だけ厳密検査する
+    # (牌インデックス 34, 35 は常にパディング 0 なので、そこは 0 のままにする)
+    _flat = np.zeros((256, 36), dtype=np.float32)
+    _flat[5, 13] = 1.0
+    _flat[213, :34] = 0.3
+    _flat[221, 24] = 1.0
+    _flat[222, :34] = 3 / 4.0
+    _flat[224, 7] = 1.0
+    assert_roundtrip(_flat.reshape(256, 4, 9))
+
+    build_dataset(
+        args.logs,
+        args.out,
+        max_files=args.max_files,
+        call_negative_rate=args.call_negative_rate,
+        compression=None if args.compression == "none" else args.compression,
+        workers=args.workers,
+        seed=args.seed,
+    )
