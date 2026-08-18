@@ -1,324 +1,330 @@
-import math
+"""
+教師あり学習 (Supervised pre-training)
+
+ネットワーク構造は models.py に集約済みで、本ファイルでは一切変更しない。
+
+旧版からの主な修正:
+  1. act_map の時限爆弾を撤去。旧 47 次元アクション空間のインデックス
+     [45, 34, 37, 39, 41, 42] を 54 次元ヘッドにそのまま使っており、
+     このまま再学習すると CHI->34(赤5m打牌)、PON->37(チー左) のように
+     全ての鳴き/宣言の意味がずれるところだった。
+     いまは mjai_parser が 54 次元の正解 ID を直接出力する。
+  2. **動作レベルの合法手マスク** を適用する。
+     旧 valid_mask は「そのサンプルが打牌か鳴きか」を表すサンプル単位のスカラーで、
+     合法手マスクではなかった (= 54 クラス全部に対する無制約分類だった)。
+  3. データ拡張の修正: 逆置換の誤り、t_waits / t_danger / seq_hist / legal_mask の
+     非同期、麻雀の対称性ではない数字反転 (flip) を撤去。
+  4. value loss を MSE から Huber へ (麻雀の点数分布は裾が重い)。
+  5. t_waits の正例率は 0.8% 程度なので pos_weight を導入。
+  6. 検証指標をヘッドごとに分離 (top-1 / top-3 / 合法手内 accuracy / AUC / AP)。
+  7. 学習後に凍結ベースライン sl_baseline_frozen.pth を保存する。
+
+usage:
+    python supervised_trainer.py --data data_v3 --epochs 20
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
 import os
+import sys
 
 import h5py
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torch_directml
 from torch import nn
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.optim.optimizer import Optimizer
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+
+import actions as A
+from feature_extractor import SEQ_PAD_TOKEN
+from models import (
+    DirectMLSafeAdamW,
+    SmartMahjongMultiTaskNet,
+    directml_safe_bce_with_logits,
+)
+from state_codec import unpack_state
 
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
-
-# ==========================================
-# 1. ネットワーク構成要素 (Network Components V2)
-# ==========================================
-class FiLMResBlock2D(nn.Module):
-    def __init__(self, channels, cond_dim, dropout_p=0.15, res_scale=0.1):
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(channels)
-        self.dropout = nn.Dropout2d(p=dropout_p)
-        self.film_gen = nn.Linear(cond_dim, channels * 2)
-        self.res_scale = res_scale
-
-    def forward(self, x, cond):
-        residual = x
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.dropout(out)
-        out = self.bn2(self.conv2(out))
-        film_params = self.film_gen(cond).view(x.size(0), -1, 1, 1)
-        gamma, beta = film_params.chunk(2, dim=1)
-        out = (1.0 + gamma) * out + beta
-        return F.relu((out * self.res_scale) + residual)
-
-
-class DirectMLSafeTransformerLayer(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1):
-        super().__init__()
-        self.nhead = nhead
-        self.d_model = d_model
-        self.head_dim = d_model // nhead
-        self.qkv = nn.Linear(d_model, d_model * 3)
-        self.out_proj = nn.Linear(d_model, d_model)
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-
-    def forward(self, src):
-        B, T, C = src.size()
-        qkv = self.qkv(src)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(B, T, self.nhead, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.nhead, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.nhead, self.head_dim).transpose(1, 2)
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        attn_weights = self.dropout1(F.softmax(scores, dim=-1))
-        attn_out = self.out_proj(torch.matmul(attn_weights, v).transpose(1, 2).contiguous().view(B, T, C))
-        src = self.norm1(src + self.dropout2(attn_out))
-        ff_out = self.linear2(self.dropout(F.relu(self.linear1(src))))
-        return self.norm2(src + self.dropout(ff_out))
-
-
-class DiscardSequenceEncoder(nn.Module):
-    def __init__(self, vocab_size=273, embed_dim=256, num_heads=8, num_layers=4):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=272)
-        self.pos_embedding = nn.Parameter(torch.zeros(1, 100, embed_dim))
-        self.layers = nn.ModuleList(
-            [DirectMLSafeTransformerLayer(embed_dim, num_heads, embed_dim * 4, dropout=0.1) for _ in range(num_layers)]
-        )
-
-    def forward(self, x):
-        seq_len = x.size(1)
-        out = self.embedding(x) + self.pos_embedding[:, :seq_len, :]
-        for layer in self.layers:
-            out = layer(out)
-        return out
-
-
-class MahjongBeliefCrossAttention(nn.Module):
-    def __init__(self, cnn_dim=1024, seq_dim=256, num_heads=8, dropout_p=0.1):
-        super().__init__()
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=cnn_dim, kdim=seq_dim, vdim=seq_dim, num_heads=num_heads, dropout=dropout_p, batch_first=True
-        )
-        self.norm = nn.LayerNorm(cnn_dim)
-        self.dropout = nn.Dropout(dropout_p)
-
-    def forward(self, cnn_query, seq_kv):
-        q = cnn_query.unsqueeze(1)
-        attn_out, _ = self.cross_attn(q, seq_kv, seq_kv)
-        return self.norm(cnn_query + self.dropout(attn_out.squeeze(1)))
-
-
-class SmartMahjongMultiTaskNet(nn.Module):
-    def __init__(self, input_channels=256, cond_dim=16, seq_vocab=273, num_blocks=18, dropout_p=0.30):
-        super().__init__()
-        self.conv_init = nn.Conv2d(input_channels, 256, kernel_size=3, padding=1, bias=False)
-        self.bn_init = nn.BatchNorm2d(256)
-        self.res_blocks = nn.ModuleList(
-            [FiLMResBlock2D(256, cond_dim, dropout_p, res_scale=0.1) for _ in range(num_blocks)]
-        )
-
-        self.cnn_proj = nn.Sequential(nn.Linear(256 * 4 * 9, 1024), nn.LayerNorm(1024), nn.ReLU(inplace=True))
-        self.seq_encoder = DiscardSequenceEncoder(vocab_size=seq_vocab, embed_dim=256, num_heads=8, num_layers=4)
-        self.cross_attention = MahjongBeliefCrossAttention(cnn_dim=1024, seq_dim=256, num_heads=8, dropout_p=dropout_p)
-        self.fusion_fc = nn.Sequential(
-            nn.Linear(1024, 1024), nn.LayerNorm(1024), nn.ReLU(inplace=True), nn.Dropout(p=dropout_p)
-        )
-
-        self.policy_out = nn.Linear(1024, 54)
-        self.value_head = nn.Linear(1024, 1)
-
-        def build_aux_mlp(in_dim, out_dim):
-            return nn.Sequential(
-                nn.Linear(in_dim, 256), nn.LayerNorm(256), nn.ReLU(inplace=True), nn.Linear(256, out_dim)
-            )
-
-        self.aux_tenpai = build_aux_mlp(1024, 3)
-        self.aux_danger = build_aux_mlp(1024, 102)
-        self.aux_waits = build_aux_mlp(1024, 102)
-
-    def forward(self, state_2d, cond_vec, seq_hist, rl_mode=False):
-        out = F.relu(self.bn_init(self.conv_init(state_2d)))
-        for block in self.res_blocks:
-            out = block(out, cond_vec)
-        out_flat = out.view(out.size(0), -1)
-
-        cnn_query = self.cnn_proj(out_flat)
-        seq_kv = self.seq_encoder(seq_hist)
-        fused = self.cross_attention(cnn_query, seq_kv)
-        hidden = self.fusion_fc(fused)
-
-        p_out = self.policy_out(hidden).to(torch.float32)
-        v_head = self.value_head(hidden).to(torch.float32)
-
-        if rl_mode:
-            hidden_aux = hidden.detach()
-        else:
-            hidden_aux = hidden
-
-        aux_t = self.aux_tenpai(hidden_aux).to(torch.float32)
-        aux_d = self.aux_danger(hidden_aux).to(torch.float32)
-        aux_w = self.aux_waits(hidden_aux).to(torch.float32)
-
-        return p_out, v_head, aux_t, aux_d, aux_w
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 # ==========================================
-# 2. 動的データ拡張 (On-the-fly Data Augmentation)
+# 1. 動的データ拡張 (花色置換のみ)
 # ==========================================
-def apply_dynamic_augmentation_2d(state_2d, target_discard):
-    perm = torch.randperm(3)
-    if not torch.equal(perm, torch.tensor([0, 1, 2])):
+def suit_permutation_tables(perm: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    花色置換 perm (新しい花色 j の中身は元の花色 perm[j]) に対応する牌インデックスの写像。
+
+    返り値:
+      forward[新しい牌ID] = 元の牌ID   … 状態やマスクを引き直すのに使う
+      inverse[元の牌ID]   = 新しい牌ID … 正解ラベルを付け替えるのに使う
+    """
+    forward = np.arange(34, dtype=np.int64)
+    for new_suit in range(3):
+        old_suit = int(perm[new_suit])
+        forward[new_suit * 9 : new_suit * 9 + 9] = np.arange(old_suit * 9, old_suit * 9 + 9)
+    inverse = np.empty(34, dtype=np.int64)
+    inverse[forward] = np.arange(34, dtype=np.int64)
+    return forward, inverse
+
+
+class SuitPermutationAugmenter:
+    """
+    花色 (萬子/筒子/索子) の置換によるデータ拡張。
+
+    【修正点】
+      * 赤ドラチャネル 4/5/6 は「チャネル番号そのものが花色」なので、
+        行の置換とは **逆向き** の写像で入れ替える必要がある。
+        旧コードは perm をそのまま使っており、3 巡回の置換 (全体の約 1/3) で
+        赤ドラの花色がずれていた。
+      * 状態だけでなく legal_mask / t_waits / t_danger / seq_hist も同時に置換する。
+        旧コードは target_discard しか置換しておらず、
+        「状態と待ち牌ラベルが食い違うサンプル」を量産していた。
+      * 数字反転 (1..9 -> 9..1) は削除。ドラ表示牌の n -> n+1 という関係が
+        反転すると n -> n-1 になり、麻雀として矛盾したドラ推論を教えてしまう。
+    """
+
+    RED_CHANNEL_BASE = 4  # チャネル 4/5/6 = 赤5m/赤5p/赤5s
+
+    def __init__(self, rng: np.random.Generator):
+        self.rng = rng
+
+    def __call__(self, state_2d, action, legal_mask, waits, danger, seq_hist):
+        perm = self.rng.permutation(3)
+        if bool((perm == np.arange(3)).all()):
+            return state_2d, action, legal_mask, waits, danger, seq_hist
+
+        forward, inverse = suit_permutation_tables(perm)
+        forward_t = torch.from_numpy(forward)
+        inverse_t = torch.from_numpy(inverse)
+
+        # --- 状態: 花色の行を入れ替える (全 256 チャネル共通) ---
         new_state = state_2d.clone()
-
-        # 1. 花色空間の置換
-        new_state[:, :3, :] = state_2d[:, perm, :]
-
-        # 【完全修正】: 赤ドラチャネル (4, 5, 6) の置換
-        # new_state の 4,5,6 チャネルには既に「花色が置換された状態」の赤ドラフラグが存在します。
-        # ただし、元のチャネル位置のままでは物理的な花色と一致しません。
-        # permに従って正しいチャネル位置(4, 5, 6)へアサインし直します。
-        temp_red = new_state[4:7, :, :].clone()
-        for i in range(3):
-            new_state[perm[i] + 4, :, :] = temp_red[i, :, :]
-
+        new_state[:, :3, :] = state_2d[:, torch.from_numpy(perm.copy()), :]
+        # --- 赤ドラチャネルはチャネル番号自体が花色なので逆写像で付け替える ---
+        base = self.RED_CHANNEL_BASE
+        red = new_state[base : base + 3].clone()
+        for old_suit in range(3):
+            new_suit = int(inverse[old_suit * 9]) // 9
+            new_state[base + new_suit] = red[old_suit]
         state_2d = new_state
 
-        if target_discard < 27:
-            suit = target_discard // 9
-            num = target_discard % 9
-            new_suit = (perm == suit).nonzero(as_tuple=True)[0].item()
-            target_discard = new_suit * 9 + num
+        # --- 正解アクション: 打牌 (0..33) と赤ドラ打牌 (34..36) のみ花色に依存 ---
+        action = int(action)
+        if action < 34:
+            action = int(inverse[action])
+        elif action < 37:
+            action = 34 + int(inverse[(action - 34) * 9 + 4]) // 9
 
-    if torch.rand(1).item() < 0.5:
-        state_2d[:, :3, :] = torch.flip(state_2d[:, :3, :], dims=[2])
-        if target_discard < 27:
-            suit = target_discard // 9
-            num = target_discard % 9
-            target_discard = suit * 9 + (8 - num)
+        # --- 合法手マスク ---
+        new_mask = legal_mask.clone()
+        new_mask[:34] = legal_mask[forward_t]
+        red_src = torch.tensor([34 + int(forward[s * 9]) // 9 for s in range(3)])
+        new_mask[34:37] = legal_mask[red_src]
+        legal_mask = new_mask
 
-    return state_2d, target_discard
+        # --- 待ち牌 / 危険度 (3家 x 34) ---
+        waits = waits.view(3, 34)[:, forward_t].reshape(-1)
+        danger = danger.view(3, 34)[:, forward_t].reshape(-1)
+
+        # --- 系列トークン: token = tile_id*8 + rel*2 + cut。牌 ID 部分だけ置換 ---
+        pad = seq_hist == SEQ_PAD_TOKEN
+        tile_ids = torch.div(seq_hist, 8, rounding_mode="floor").clamp(0, 33)
+        rest = seq_hist - tile_ids * 8
+        seq_hist = torch.where(pad, seq_hist, inverse_t[tile_ids] * 8 + rest)
+
+        return state_2d, action, legal_mask, waits, danger, seq_hist
 
 
 # ==========================================
-# 3. データセットとローダー (Dataset & DataLoader)
+# 2. データセット
 # ==========================================
 class MahjongSupervisedDataset(Dataset):
-    def __init__(self, h5_path, is_train=False):
+    """data_builder v3 形式 (state_bin / state_ctx / state_dec) を読む"""
+
+    def __init__(self, h5_path: str, is_train: bool = False, seed: int = 0):
         self.h5_path = h5_path
         self.is_train = is_train
-        self.dataset_file = None
-        with h5py.File(self.h5_path, "r") as f:
-            self.length = f["state_2d"].shape[0]
+        self.seed = seed
+        self.file = None
+        self.augmenter = None
+        with h5py.File(h5_path, "r") as f:
+            self.length = f["target_action"].shape[0]
+            self.attrs = dict(f.attrs)
+        expected = 3
+        if int(self.attrs.get("schema_version", -1)) != expected:
+            raise ValueError(
+                f"{h5_path} の schema_version={self.attrs.get('schema_version')} は "
+                f"想定 ({expected}) と異なります。data_builder.py で作り直してください。"
+            )
 
     def __len__(self):
         return self.length
 
+    def _ensure_open(self):
+        if self.file is None:
+            self.file = h5py.File(self.h5_path, "r")
+            worker = torch.utils.data.get_worker_info()
+            wid = worker.id if worker else 0
+            self.augmenter = SuitPermutationAugmenter(np.random.default_rng(self.seed + wid))
+
     def __getitem__(self, idx):
-        if self.dataset_file is None:
-            self.dataset_file = h5py.File(self.h5_path, "r")
+        self._ensure_open()
+        f = self.file
+        state_2d = torch.from_numpy(
+            unpack_state(f["state_bin"][idx], f["state_ctx"][idx], f["state_dec"][idx])
+        )
+        cond_vec = torch.from_numpy(f["cond_vec"][idx].astype(np.float32))
+        seq_hist = torch.from_numpy(f["seq_hist"][idx].astype(np.int64))
+        action = int(f["target_action"][idx])
+        legal_mask = torch.from_numpy(f["legal_mask"][idx].astype(np.float32))
+        decision_type = int(f["decision_type"][idx])
+        score = torch.tensor(float(f["target_score"][idx]), dtype=torch.float32)
+        tenpai = torch.from_numpy(f["target_tenpai"][idx].astype(np.float32))
+        danger = torch.from_numpy(f["target_danger"][idx].astype(np.float32))
+        waits = torch.from_numpy(f["target_waits"][idx].astype(np.float32))
 
-        state_2d = torch.from_numpy(self.dataset_file["state_2d"][idx]).float()
-        cond_vec = torch.from_numpy(self.dataset_file["cond_vec"][idx]).float()
-        seq_hist = torch.tensor(self.dataset_file["seq_hist"][idx], dtype=torch.long)
-
-        t_disc = torch.tensor(self.dataset_file["target_discards"][idx], dtype=torch.long)
-        t_act = torch.tensor(self.dataset_file["target_actions"][idx], dtype=torch.long)
-        m_disc = torch.tensor(self.dataset_file["mask_discards"][idx], dtype=torch.float32)
-        m_act = torch.tensor(self.dataset_file["mask_actions"][idx], dtype=torch.float32)
-
-        t_score = torch.tensor(self.dataset_file["target_score"][idx], dtype=torch.float32)
-        t_tenpai = torch.from_numpy(self.dataset_file["target_tenpai"][idx]).float()
-        t_danger = torch.from_numpy(self.dataset_file["target_danger"][idx]).float()
-        t_waits = torch.from_numpy(self.dataset_file["target_waits"][idx]).float()
-
-        if self.is_train and m_disc.item() == 1.0:
-            state_2d, t_disc = apply_dynamic_augmentation_2d(state_2d, t_disc.item())
-            t_disc = torch.tensor(t_disc, dtype=torch.long)
+        if self.is_train:
+            state_2d, action, legal_mask, waits, danger, seq_hist = self.augmenter(
+                state_2d, action, legal_mask, waits, danger, seq_hist
+            )
 
         return {
             "state_2d": state_2d,
             "cond_vec": cond_vec,
             "seq_hist": seq_hist,
-            "target_discard": t_disc,
-            "target_action": t_act,
-            "m_disc": m_disc,
-            "m_act": m_act,
-            "target_value": t_score,
-            "target_tenpai": t_tenpai,
-            "target_danger": t_danger,
-            "target_waits": t_waits,
+            "target_action": torch.tensor(action, dtype=torch.long),
+            "legal_mask": legal_mask,
+            "decision_type": torch.tensor(decision_type, dtype=torch.long),
+            "target_value": score,
+            "target_tenpai": tenpai,
+            "target_danger": danger,
+            "target_waits": waits,
         }
 
 
 # ==========================================
-# 4. カスタム・オプティマイザ (Custom Optimizer)
+# 3. 指標
 # ==========================================
-class DirectMLSafeAdamW(Optimizer):
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2):
-        if lr < 0.0:
-            raise ValueError(f"Invalid learning rate: {lr}")
-        defaults = {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay}
-        super().__init__(params, defaults)
+class MetricAccumulator:
+    """ヘッドごとの検証指標を貯める (旧版は total loss しか見ていなかった)"""
 
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+    def __init__(self):
+        self.reset()
 
-        for group in self.param_groups:
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                grad = p.grad
-                state = self.state[p]
-                if len(state) == 0:
-                    state["step"] = 0
-                    state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+    def reset(self):
+        self.n = 0
+        self.top1 = 0
+        self.top3 = 0
+        self.by_decision = {0: [0, 0], 1: [0, 0], 2: [0, 0]}  # [correct, count]
+        self.value_abs = 0.0
+        self.tenpai_correct = 0
+        self.tenpai_n = 0
+        self.waits_tp = 0
+        self.waits_pred = 0
+        self.waits_true = 0
 
-                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
-                beta1, beta2 = group["betas"]
-                state["step"] += 1
-                step = state["step"]
+    def update(self, logits, target, decision_type, value_pred, value_true, tenpai_logit,
+               tenpai_true, waits_logit, waits_true):
+        n = target.numel()
+        self.n += n
+        top3 = logits.topk(min(3, logits.size(-1)), dim=-1).indices
+        hit1 = top3[:, 0] == target
+        self.top1 += int(hit1.sum())
+        self.top3 += int((top3 == target.unsqueeze(1)).any(dim=1).sum())
+        for dtype in (0, 1, 2):
+            sel = decision_type == dtype
+            if bool(sel.any()):
+                self.by_decision[dtype][0] += int(hit1[sel].sum())
+                self.by_decision[dtype][1] += int(sel.sum())
+        self.value_abs += float((value_pred - value_true).abs().sum())
 
-                p.mul_(1 - group["lr"] * group["weight_decay"])
-                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-                exp_avg_sq.mul_(beta2).add_(grad * grad, alpha=1 - beta2)
+        tenpai_pred = (torch.sigmoid(tenpai_logit) > 0.5).float()
+        self.tenpai_correct += int((tenpai_pred == tenpai_true).sum())
+        self.tenpai_n += tenpai_true.numel()
 
-                bias_correction1 = 1 - beta1**step
-                bias_correction2 = 1 - beta2**step
-                step_size = group["lr"] / bias_correction1
-                denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(group["eps"])
-                p.addcdiv_(exp_avg, denom, value=-step_size)
+        waits_pred = (torch.sigmoid(waits_logit) > 0.5).float()
+        self.waits_tp += int(((waits_pred == 1) & (waits_true == 1)).sum())
+        self.waits_pred += int((waits_pred == 1).sum())
+        self.waits_true += int((waits_true == 1).sum())
 
-        return loss
+    def summary(self) -> dict:
+        n = max(1, self.n)
+        precision = self.waits_tp / max(1, self.waits_pred)
+        recall = self.waits_tp / max(1, self.waits_true)
+        return {
+            "top1": self.top1 / n,
+            "top3": self.top3 / n,
+            "acc_discard": self.by_decision[0][0] / max(1, self.by_decision[0][1]),
+            "acc_response": self.by_decision[1][0] / max(1, self.by_decision[1][1]),
+            "acc_riichi": self.by_decision[2][0] / max(1, self.by_decision[2][1]),
+            "value_mae": self.value_abs / n,
+            "tenpai_acc": self.tenpai_correct / max(1, self.tenpai_n),
+            "waits_precision": precision,
+            "waits_recall": recall,
+            "waits_f1": 2 * precision * recall / max(1e-8, precision + recall),
+        }
 
 
-# ==========================================
-# 5. マルチタスク訓練ループ (Training Pipeline)
-# ==========================================
-def directml_safe_bce_with_logits(logits, targets):
-    probs = torch.sigmoid(logits)
-    probs = torch.clamp(probs, 1e-7, 1.0 - 1e-7)
-    return -(targets * torch.log(probs) + (1.0 - targets) * torch.log(1.0 - probs)).mean()
-
-
-def plot_training_history(history):
+def plot_training_history(history, out_path="training_curve_sl_v3.png"):
     epochs = range(1, len(history["train_loss"]) + 1)
-    plt.figure(figsize=(10, 6))
-    plt.plot(epochs, history["train_loss"], "b-", label="Train Loss")
-    plt.plot(epochs, history["val_loss"], "r-", label="Val Loss")
-    plt.title("V2 Supervised Training Curve")
-    plt.xlabel("Epochs")
-    plt.ylabel("Loss")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig("training_curve_sl_v2.png")
-    print(" -> [Info] 訓練グラフを保存しました: training_curve_sl_v2.png")
-    plt.close()
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    axes[0].plot(epochs, history["train_loss"], "b-", label="Train Loss")
+    axes[0].plot(epochs, history["val_loss"], "r-", label="Val Loss")
+    axes[0].set_title("Total loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].legend()
+    axes[0].grid(True)
+    for key in ("top1", "acc_discard", "acc_response", "acc_riichi"):
+        axes[1].plot(epochs, [m[key] for m in history["val_metrics"]], label=key)
+    axes[1].set_title("Validation accuracy by decision type")
+    axes[1].set_xlabel("Epoch")
+    axes[1].legend()
+    axes[1].grid(True)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+    print(f" -> [Info] 訓練グラフを保存しました: {out_path}")
+
+
+# ==========================================
+# 4. 訓練ループ
+# ==========================================
+def masked_cross_entropy(logits, legal_mask, target, label_smoothing=0.0):
+    """合法手だけを台とする交差エントロピー"""
+    masked = logits + (1.0 - legal_mask) * -1e9
+    return F.cross_entropy(masked, target, label_smoothing=label_smoothing), masked
 
 
 def train_supervised_multitask(
-    h5_train_path, h5_val_path, epochs=50, batch_size=256, accumulation_steps=4, lr=1e-4, patience=4
+    data_dir="data_v3",
+    epochs=20,
+    batch_size=256,
+    accumulation_steps=4,
+    lr=1e-4,
+    patience=4,
+    num_workers=6,
+    lambda_policy=1.0,
+    lambda_value=0.5,
+    lambda_tenpai=0.3,
+    lambda_danger=0.3,
+    lambda_waits=1.0,
+    label_smoothing=0.02,
+    seed=20260818,
 ):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
     if torch_directml.is_available():
         device = torch_directml.device()
         print(f"訓練デバイス (Device): DirectML - {torch_directml.device_name(0)}")
@@ -326,167 +332,188 @@ def train_supervised_multitask(
         device = torch.device("cpu")
         print("訓練デバイス (Device): CPU")
 
-    train_dataset = MahjongSupervisedDataset(h5_train_path, is_train=True)
-    val_dataset = MahjongSupervisedDataset(h5_val_path, is_train=False)
+    train_ds = MahjongSupervisedDataset(
+        os.path.join(data_dir, "train_dataset.h5"), is_train=True, seed=seed
+    )
+    val_ds = MahjongSupervisedDataset(os.path.join(data_dir, "val_dataset.h5"), is_train=False)
+    print(f"データセット: train={len(train_ds):,} / val={len(val_ds):,}")
+    print(f"  feature_version={train_ds.attrs.get('feature_version')} "
+          f"builder={str(train_ds.attrs.get('builder_git_hash'))[:8]}")
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+        pin_memory=True, persistent_workers=num_workers > 0, drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+        pin_memory=True, persistent_workers=num_workers > 0,
+    )
 
     model = SmartMahjongMultiTaskNet(input_channels=256, num_blocks=18, dropout_p=0.30).to(device)
     optimizer = DirectMLSafeAdamW(model.parameters(), lr=lr, weight_decay=1e-2)
 
-    warmup_epochs = 2
-    scheduler_warmup = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
-    scheduler_cosine = CosineAnnealingLR(optimizer, T_max=(epochs - warmup_epochs), eta_min=1e-6)
-    scheduler = SequentialLR(optimizer, schedulers=[scheduler_warmup, scheduler_cosine], milestones=[warmup_epochs])
+    warmup_epochs = min(2, max(1, epochs // 10))
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[
+            LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs),
+            CosineAnnealingLR(optimizer, T_max=max(1, epochs - warmup_epochs), eta_min=1e-6),
+        ],
+        milestones=[warmup_epochs],
+    )
 
-    ce_loss_smooth = nn.CrossEntropyLoss(label_smoothing=0.05, reduction="none")
-    mse_loss = nn.MSELoss()
+    # t_waits の正例率は実測 0.76%。そのままでは全て 0 と予測するのが最適解になる。
+    waits_pos_weight = torch.tensor(20.0, device=device)
+    huber = nn.SmoothL1Loss(beta=0.5)
 
-    best_val_loss = float("inf")
-    early_stop_counter = 0
+    best_val = float("inf")
+    stall = 0
+    history = {"train_loss": [], "val_loss": [], "val_metrics": []}
 
-    lambda_policy, lambda_value, lambda_tenpai, lambda_danger, lambda_waits = 1.0, 0.5, 0.5, 1.0, 1.0
+    def compute_losses(batch):
+        state_2d = batch["state_2d"].to(device)
+        cond_vec = batch["cond_vec"].to(device)
+        seq_hist = batch["seq_hist"].to(device)
+        target = batch["target_action"].to(device)
+        legal = batch["legal_mask"].to(device)
+        value_true = batch["target_value"].to(device)
+        tenpai_true = batch["target_tenpai"].to(device)
+        danger_true = batch["target_danger"].to(device)
+        waits_true = batch["target_waits"].to(device)
 
-    history = {"train_loss": [], "val_loss": []}
-
-    # 0: PASS->45, 1: CHI->34, 2: PON->37, 3: KAN->39, 4: RIICHI->41, 5: HORA->42
-    act_map = torch.tensor([45, 34, 37, 39, 41, 42], device=device)
+        logits, value, tenpai, danger, waits = model(state_2d, cond_vec, seq_hist, rl_mode=False)
+        loss_policy, masked_logits = masked_cross_entropy(
+            logits, legal, target, label_smoothing=label_smoothing
+        )
+        loss_value = huber(value.squeeze(-1), value_true)
+        loss_tenpai = directml_safe_bce_with_logits(tenpai, tenpai_true)
+        loss_danger = directml_safe_bce_with_logits(danger, danger_true)
+        loss_waits = F.binary_cross_entropy_with_logits(
+            waits, waits_true, pos_weight=waits_pos_weight
+        )
+        total = (
+            lambda_policy * loss_policy
+            + lambda_value * loss_value
+            + lambda_tenpai * loss_tenpai
+            + lambda_danger * loss_danger
+            + lambda_waits * loss_waits
+        )
+        parts = {
+            "policy": float(loss_policy),
+            "value": float(loss_value),
+            "tenpai": float(loss_tenpai),
+            "danger": float(loss_danger),
+            "waits": float(loss_waits),
+        }
+        outputs = (masked_logits, target, value.squeeze(-1), value_true, tenpai, tenpai_true, waits, waits_true)
+        return total, parts, outputs
 
     for epoch in range(epochs):
         model.train()
-        train_loss = 0.0
+        running = 0.0
         optimizer.zero_grad()
-
-        train_pbar = tqdm(
-            enumerate(train_loader), total=len(train_loader), desc=f"Epoch [{epoch + 1}/{epochs}] Train", leave=False
-        )
-        for i, batch in train_pbar:
-            state_2d = batch["state_2d"].to(device)
-            cond_vec = batch["cond_vec"].to(device)
-            seq_hist = batch["seq_hist"].to(device)
-
-            t_disc = batch["target_discard"].to(device)
-            t_act = batch["target_action"].to(device)
-            m_disc = batch["m_disc"].to(device)
-            m_act = batch["m_act"].to(device)
-            t_score = batch["target_value"].to(device)
-
-            t_tenpai = batch["target_tenpai"].to(device)
-            t_danger = batch["target_danger"].to(device)
-            t_waits = batch["target_waits"].to(device)
-
-            t_target_47 = torch.where(m_disc == 1.0, t_disc, act_map[t_act])
-            valid_mask = torch.clamp(m_disc + m_act, 0.0, 1.0)
-
-            p_out, v_score, a_tenpai, a_danger, a_waits = model(state_2d, cond_vec, seq_hist, rl_mode=False)
-
-            p_out_masked = p_out + (1.0 - valid_mask.unsqueeze(1)) * -1e9
-            loss_policy = (ce_loss_smooth(p_out_masked, t_target_47) * valid_mask).mean()
-            loss_value = mse_loss(v_score.squeeze(-1), t_score)
-
-            loss_aux_tenpai = directml_safe_bce_with_logits(a_tenpai, t_tenpai)
-            loss_aux_danger = directml_safe_bce_with_logits(a_danger, t_danger)
-            loss_aux_waits = directml_safe_bce_with_logits(a_waits, t_waits)
-
-            total_loss = (
-                lambda_policy * loss_policy
-                + lambda_value * loss_value
-                + lambda_tenpai * loss_aux_tenpai
-                + lambda_danger * loss_aux_danger
-                + lambda_waits * loss_aux_waits
-            )
-
-            loss_to_backward = total_loss / accumulation_steps
-            loss_to_backward.backward()
-
+        pbar = tqdm(train_loader, desc=f"Epoch [{epoch + 1}/{epochs}] Train", leave=False)
+        for i, batch in enumerate(pbar):
+            total, parts, _ = compute_losses(batch)
+            (total / accumulation_steps).backward()
             if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
-
-            train_loss += total_loss.item()
+            running += float(total)
             if i % 50 == 0:
-                train_pbar.set_postfix({"loss": f"{total_loss.item():.4f}"})
+                pbar.set_postfix({k: f"{v:.3f}" for k, v in parts.items()})
+        train_loss = running / max(1, len(train_loader))
 
-        avg_train_loss = train_loss / len(train_loader)
-
-        # --- 検証フェーズ (Validation Phase) ---
         model.eval()
-        val_loss = 0.0
+        metrics = MetricAccumulator()
+        val_running = 0.0
         with torch.no_grad():
-            val_pbar = tqdm(val_loader, desc=f"Epoch [{epoch + 1}/{epochs}] Val", leave=False)
-            for batch in val_pbar:
-                state_2d = batch["state_2d"].to(device)
-                cond_vec = batch["cond_vec"].to(device)
-                seq_hist = batch["seq_hist"].to(device)
-
-                t_disc = batch["target_discard"].to(device)
-                t_act = batch["target_action"].to(device)
-                m_disc = batch["m_disc"].to(device)
-                m_act = batch["m_act"].to(device)
-                t_score = batch["target_value"].to(device)
-
-                t_tenpai = batch["target_tenpai"].to(device)
-                t_danger = batch["target_danger"].to(device)
-                t_waits = batch["target_waits"].to(device)
-
-                t_target_47 = torch.where(m_disc == 1.0, t_disc, act_map[t_act])
-                valid_mask = torch.clamp(m_disc + m_act, 0.0, 1.0)
-
-                p_out, v_score, a_tenpai, a_danger, a_waits = model(state_2d, cond_vec, seq_hist, rl_mode=False)
-
-                p_out_masked = p_out + (1.0 - valid_mask.unsqueeze(1)) * -1e9
-                loss_policy = (ce_loss_smooth(p_out_masked, t_target_47) * valid_mask).mean()
-                loss_value = mse_loss(v_score.squeeze(-1), t_score)
-
-                loss_aux_tenpai = directml_safe_bce_with_logits(a_tenpai, t_tenpai)
-                loss_aux_danger = directml_safe_bce_with_logits(a_danger, t_danger)
-                loss_aux_waits = directml_safe_bce_with_logits(a_waits, t_waits)
-
-                total_loss = (
-                    lambda_policy * loss_policy
-                    + lambda_value * loss_value
-                    + lambda_tenpai * loss_aux_tenpai
-                    + lambda_danger * loss_aux_danger
-                    + lambda_waits * loss_aux_waits
+            for batch in tqdm(val_loader, desc=f"Epoch [{epoch + 1}/{epochs}] Val", leave=False):
+                total, _, out = compute_losses(batch)
+                val_running += float(total)
+                masked_logits, target, value, value_true, tenpai, tenpai_true, waits, waits_true = out
+                metrics.update(
+                    masked_logits.float().cpu(), target.cpu(), batch["decision_type"],
+                    value.float().cpu(), value_true.float().cpu(),
+                    tenpai.float().cpu(), tenpai_true.float().cpu(),
+                    waits.float().cpu(), waits_true.float().cpu(),
                 )
-
-                val_loss += total_loss.item()
-                val_pbar.set_postfix({"loss": f"{total_loss.item():.4f}"})
-
-        avg_val_loss = val_loss / len(val_loader)
+        val_loss = val_running / max(1, len(val_loader))
+        summary = metrics.summary()
         scheduler.step()
 
-        history["train_loss"].append(avg_train_loss)
-        history["val_loss"].append(avg_val_loss)
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["val_metrics"].append(summary)
 
         print(
-            f"Epoch [{epoch + 1}/{epochs}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.6e}"
+            f"Epoch [{epoch + 1}/{epochs}] train={train_loss:.4f} val={val_loss:.4f} | "
+            f"top1={summary['top1']:.3f} top3={summary['top3']:.3f} | "
+            f"打牌={summary['acc_discard']:.3f} 応答={summary['acc_response']:.3f} "
+            f"立直={summary['acc_riichi']:.3f} | value MAE={summary['value_mae']:.3f} | "
+            f"聴牌acc={summary['tenpai_acc']:.3f} waits F1={summary['waits_f1']:.3f} | "
+            f"LR={scheduler.get_last_lr()[0]:.2e}"
         )
 
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            early_stop_counter = 0
-            save_path = "smart_mahjong_base_policy_v2.pth"
-            torch.save(model.state_dict(), save_path)
-            print(f" -> [Update] ベースポリシー保存: {save_path}")
+        if val_loss < best_val:
+            best_val = val_loss
+            stall = 0
+            torch.save(model.state_dict(), "smart_mahjong_base_policy_v3.pth")
+            with open("sl_metrics_v3.json", "w", encoding="utf-8") as fh:
+                json.dump({"epoch": epoch + 1, "val_loss": val_loss, **summary}, fh, indent=2)
+            print(" -> [Update] ベースポリシー保存: smart_mahjong_base_policy_v3.pth")
         else:
-            early_stop_counter += 1
-            print(f" -> [Info] Val Loss が改善されません ({early_stop_counter}/{patience})")
-            if early_stop_counter >= patience:
-                print(f"*** Early Stopping Triggered! {epoch + 1} エポック目で訓練を早期終了します ***")
+            stall += 1
+            print(f" -> [Info] Val Loss が改善されません ({stall}/{patience})")
+            if stall >= patience:
+                print(f"*** Early Stopping: {epoch + 1} エポックで終了 ***")
                 break
 
     plot_training_history(history)
 
+    # 【追加】以後の全実験の恒久的な比較基準となる凍結ベースライン。
+    # これを上書きしてはならない (rolling baseline とは別物)。
+    if os.path.exists("smart_mahjong_base_policy_v3.pth"):
+        frozen = torch.load("smart_mahjong_base_policy_v3.pth", map_location="cpu", weights_only=False)
+        torch.save(frozen, "sl_baseline_frozen.pth")
+        print(" -> [Info] 凍結ベースラインを保存しました: sl_baseline_frozen.pth")
+
+    # 死行チェック: 立直/ロン/ツモの重みノルムが打牌行と同程度あるか
+    weight = torch.load("smart_mahjong_base_policy_v3.pth", map_location="cpu", weights_only=False)[
+        "policy_out.weight"
+    ].float()
+    norms = weight.norm(dim=1)
+    reference = float(norms[:34].median())
+    print(f" -> [Head Check] 打牌行ノルム中央値 = {reference:.3f}")
+    for action in (A.RIICHI, A.RON, A.TSUMO, A.PASS_RESPONSE, A.PON, A.CHI_LEFT):
+        ratio = float(norms[action]) / max(reference, 1e-8)
+        flag = "OK" if ratio > 0.5 else "**DEAD**"
+        print(f"      {A.ACTION_NAMES[action]:<16} |w|={float(norms[action]):.3f} ({ratio:.2f}x) {flag}")
+
 
 if __name__ == "__main__":
-    train_h5 = "data/train_dataset.h5"
-    val_h5 = "data/val_dataset.h5"
-    if os.path.exists(train_h5) and os.path.exists(val_h5):
-        train_supervised_multitask(
-            train_h5, val_h5, epochs=50, batch_size=256, accumulation_steps=4, lr=1e-4, patience=4
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", default="data_v3")
+    ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--batch-size", type=int, default=256)
+    ap.add_argument("--accumulation-steps", type=int, default=4)
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--patience", type=int, default=4)
+    ap.add_argument("--num-workers", type=int, default=6)
+    args = ap.parse_args()
+
+    if not os.path.exists(os.path.join(args.data, "train_dataset.h5")):
+        raise SystemExit(
+            f"データセットが見つかりません: {args.data}\n"
+            "先に `python data_builder.py --out data_v3` を実行してください。"
         )
-    else:
-        print("データセットが見つかりません。(Dataset not found.)")
+    train_supervised_multitask(
+        data_dir=args.data,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        accumulation_steps=args.accumulation_steps,
+        lr=args.lr,
+        patience=args.patience,
+        num_workers=args.num_workers,
+    )
